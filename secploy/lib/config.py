@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "api_key": None,
+    "organization_id": None,
     "environment": "development",
     "sampling_rate": 1.0,
     "log_level": "INFO",
@@ -80,39 +81,49 @@ def load_config(file_path: Optional[str] = None) -> Dict[str, Union[str, int, fl
 
     # Load from file if it exists
     if file_path:
-        extension = os.path.splitext(file_path)[1].lower()
         try:
             with open(file_path, 'r') as file:
-                if extension in ['.yml', '.yaml']:
-                    file_config = yaml.safe_load(file)
+                content = file.read()
+                try:
+                    # Try YAML parsing first (works for both .yml and .secploy)
+                    file_config = yaml.safe_load(content)
+                    if file_config is None:  # Empty file
+                        file_config = {}
                     logger.info("Loaded YAML configuration.")
-                elif extension == '.json':
-                    file_config = json.load(file)
-                    logger.info("Loaded JSON configuration.")
-                elif extension in ['.conf', '.secploy']:
-                    file_config = {}
-                    for line in file:
-                        line = line.strip()
-                        if '=' in line and not line.startswith('#'):
-                            key, value = line.split('=', 1)
-                            key = key.strip().lower()
-                            value = value.strip()
-                            
-                            # Type conversion
-                            if value.lower() == 'true':
-                                value = True
-                            elif value.lower() == 'false':
-                                value = False
-                            elif value.isdigit():
-                                value = int(value)
-                            elif value.replace('.', '').isdigit() and value.count('.') == 1:
-                                value = float(value)
+                except yaml.YAMLError:
+                    # If YAML parsing fails, try JSON
+                    try:
+                        file_config = json.loads(content)
+                        logger.info("Loaded JSON configuration.")
+                    except json.JSONDecodeError:
+                        # Finally, try key=value format
+                        file_config = {}
+                        for line in content.splitlines():
+                            line = line.strip()
+                            if line and not line.startswith('#'):
+                                if '=' in line:
+                                    key, value = line.split('=', 1)
+                                    key = key.strip().lower()
+                                    value = value.strip()
+                                elif ':' in line:
+                                    key, value = line.split(':', 1)
+                                    key = key.strip().lower()
+                                    value = value.strip()
+                                else:
+                                    continue
+
+                                # Type conversion
+                                if value.lower() == 'true':
+                                    value = True
+                                elif value.lower() == 'false':
+                                    value = False
+                                elif value.isdigit():
+                                    value = int(value)
+                                elif value.replace('.', '').isdigit() and value.count('.') == 1:
+                                    value = float(value)
                                 
-                            file_config[key] = value
-                    logger.info(f"Loaded {extension} configuration.")
-                else:
-                    logger.warning(f"Unsupported config file format: {extension}")
-                    file_config = {}
+                                file_config[key] = value
+                        logger.info("Loaded key-value configuration.")
                 
                 # Update config with file values
                 config.update(file_config)

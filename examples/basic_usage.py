@@ -12,6 +12,7 @@ client = SecployClient()  # Automatically looks for .secploy file
 
 custom_config = SecployConfig(
     api_key="your-key",
+    organization_id="your-organization-id",
     environment="production",
     log_level=LogLevel.INFO,
     batch_size=100
@@ -34,6 +35,7 @@ client.log_event(
 # Example .secploy file:
 """
 api_key=your_api_key_here
+organization_id=your_organization_id_here
 environment=development
 sampling_rate=0.1
 batch_size=50

@@ -5,8 +5,8 @@ from typing import Any, Dict, Optional
 import requests
 from dataclasses import dataclass, field
 
-from lib import setup_logger, load_config, DEFAULT_CONFIG, secploy_logger
-from schemas import SecployConfig, LogLevel
+from .lib import setup_logger, secploy_logger, load_config, DEFAULT_CONFIG
+from .schemas import SecployConfig, LogLevel
 
 @dataclass
 class EventBatch:
@@ -18,6 +18,7 @@ class SecployClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
+        organization_id: Optional[str] = None,
         config_file: Optional[str] = None,
         config: Optional[SecployConfig] = DEFAULT_CONFIG,
     ):
@@ -33,14 +34,19 @@ class SecployClient:
             ValueError: If required configuration is missing
             TypeError: If configuration values have invalid types
         """
-        # Load config from file if provided
-        if config_file:
-            config = load_config(config_file)
+        # Load config from file if provided else it will load from default locations or find .secploy
+        config = load_config(config_file)
+        
+        if config is None:
+            secploy_logger.error("No valid configuration found")
+            return
             
         # Override api_key if provided directly
         if api_key:
             config.api_key = api_key
-            
+        if organization_id:
+            config.organization_id = organization_id
+
         # Special handling for log_level if it's a string
         if isinstance(config.get('log_level'), str):
             try:
@@ -52,18 +58,23 @@ class SecployClient:
                 )
 
         # Validate required fields
-        if not config.api_key:
+        if not config.get('api_key'):
             raise ValueError("API key is required")
-        if not config.ingest_url:
+        if not config.get('organization_id'):
+            raise ValueError("Organization ID is required")
+        if not config.get('ingest_url'):
             raise ValueError("Ingest URL is required")
 
         # Set instance attributes from config
-        self.api_key = config.api_key
-        self.ingest_url = config.ingest_url.rstrip("/")
-        self.heartbeat_interval = config.heartbeat_interval
-        self.max_retry = config.max_retry
-        self.debug = config.debug
-        self.log_level = config.log_level
+        self.api_key = config['api_key']
+        self.organization_id = config.get('organization_id')
+        self.environment = config.get('environment', 'development')
+        self.sampling_rate = config.get('sampling_rate', 1.0)
+        self.ingest_url = config['ingest_url'].rstrip("/")
+        self.heartbeat_interval = config.get('heartbeat_interval', 60)
+        self.max_retry = config.get('max_retry', 5)
+        self.debug = config.get('debug', False)
+        self.log_level = config.get('log_level', 'INFO')
         
         # Batch processing configuration
         self.batch_size = getattr(config, 'batch_size', 100)  # Max events per batch
@@ -77,11 +88,13 @@ class SecployClient:
         
         # Setup logging
         setup_logger(log_level=self.log_level)
+        
     
     def _headers(self):
         return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
+            "X-API-Key": f"{self.api_key}",
+            "X-Organization-ID": f"{self.organization_id}",
+            "Content-Type": "application/json",
         }
 
     def send_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
@@ -103,7 +116,7 @@ class SecployClient:
             })
             return True
         except Exception as e:
-            secploy_logger.error(f"Failed to queue event: {e}", self.debug)
+            secploy_logger.error(f"Failed to queue event: {e}")
             return False
 
     def _send_batch(self, events: list) -> bool:
@@ -120,11 +133,12 @@ class SecployClient:
         for attempt in range(self.max_retry):
             try:
                 resp = requests.post(url, json={"events": events}, headers=self._headers(), timeout=5)
+                secploy_logger.debug(f"Send batch response: {resp.status_code} - {resp.text}")
                 if resp.status_code == 200:
-                    secploy_logger.info(f"Batch of {len(events)} events sent successfully", self.debug)
+                    secploy_logger.info(f"Batch of {len(events)} events sent successfully")
                     return True
             except Exception as e:
-                secploy_logger.error(f"Send batch failed: {e}", self.debug)
+                secploy_logger.error(f"Send batch failed: {e}")
             time.sleep(1)
         return False
 
@@ -155,7 +169,7 @@ class SecployClient:
                         time.sleep(1)
 
             except Exception as e:
-                secploy_logger.error(f"Error processing events: {e}", self.debug)
+                secploy_logger.error(f"Error processing events: {e}")
 
     def _heartbeat_loop(self):
         """Send periodic heartbeats to the server."""
@@ -164,25 +178,25 @@ class SecployClient:
             try:
                 resp = requests.post(url, headers=self._headers(), timeout=5)
                 if resp.status_code == 200:
-                    secploy_logger.info(f"Heartbeat sent successfully", self.debug)
+                    secploy_logger.info(f"Heartbeat sent successfully")
                 else:
                     secploy_logger.error(f"Heartbeat failed with status {resp.status_code}", self.debug)
             except Exception as e:
-                secploy_logger.error(f"Heartbeat failed: {e}", self.debug)
+                secploy_logger.error(f"Heartbeat failed: {e}")
             time.sleep(self.heartbeat_interval)
 
     def start(self):
         """Start the client's background threads for heartbeat and event processing."""
-        secploy_logger.info("Starting Secploy client...", self.debug)
+        secploy_logger.info("Starting Secploy client...")
         self._stop_event.clear()
         
         # Start heartbeat thread
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            name="secploy-heartbeat",
-            daemon=True
-        )
-        self._heartbeat_thread.start()
+        # self._heartbeat_thread = threading.Thread(
+        #     target=self._heartbeat_loop,
+        #     name="secploy-heartbeat",
+        #     daemon=True
+        # )
+        # self._heartbeat_thread.start()
         
         # Start event processing thread
         self._event_thread = threading.Thread(
@@ -194,12 +208,12 @@ class SecployClient:
 
     def stop(self):
         """Stop the client and wait for background threads to finish."""
-        secploy_logger.info("Stopping Secploy client...", self.debug)
+        secploy_logger.info("Stopping Secploy client...")
         self._stop_event.set()
         
         # Wait for threads to finish
-        if self._heartbeat_thread:
-            self._heartbeat_thread.join(timeout=5)
+        # if self._heartbeat_thread:
+        #     self._heartbeat_thread.join(timeout=5)
         if self._event_thread:
             self._event_thread.join(timeout=5)
             

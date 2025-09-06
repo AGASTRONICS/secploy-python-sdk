@@ -1,10 +1,11 @@
 from typing import TypedDict, Optional, Union
 
-from enums import LogLevel
+from .enums import LogLevel
 
 
 class SecployConfig(TypedDict, total=False):
     api_key: str
+    organization_id: str
     environment: str
     ingest_url: str
     heartbeat_interval: int

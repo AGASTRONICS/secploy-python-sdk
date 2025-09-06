@@ -1,4 +1,4 @@
-from .config import load_config, DEFAULT_CONFIG, find_project_config, validate_config
+from .config import load_config, validate_config, find_project_config, DEFAULT_CONFIG
 from .secploy_logger import setup_logger, secploy_logger
 
 __all__ = [
