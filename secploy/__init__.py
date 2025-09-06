@@ -1,7 +1,7 @@
-from .client import SecployClient
-from .schemas import SecployConfig
-from .enums import LogLevel
+from secploy.client import SecployClient
+from secploy.schemas import SecployConfig
+from secploy.enums import LogLevel
 
-__version__ = "0.1.0"
+__version__ = "0.2.2"
 __all__ = ["SecployClient", "SecployConfig", "LogLevel"]
 

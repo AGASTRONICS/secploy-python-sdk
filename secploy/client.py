@@ -1,14 +1,14 @@
 import threading
 import time
 import queue
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 import requests
 from dataclasses import dataclass, field
 
-from lib.secploy_logger import setup_logger
-from .utils import log
-from lib.config import load_config, DEFAULT_CONFIG
-from .schemas import SecployConfig, LogLevel
+from secploy.lib.secploy_logger import setup_logger
+from secploy.utils import log
+from secploy.lib.config import load_config, DEFAULT_CONFIG
+from secploy.schemas import SecployConfig, LogLevel
 
 @dataclass
 class EventBatch:

@@ -28,3 +28,6 @@ venv/
 # IDEs
 .idea/
 *.swp
+
+# Note
+PUBLISH.md
