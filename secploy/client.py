@@ -5,10 +5,8 @@ from typing import Any, Dict, Optional
 import requests
 from dataclasses import dataclass, field
 
-from lib.secploy_logger import setup_logger
-from .utils import log
-from lib.config import load_config, DEFAULT_CONFIG
-from .schemas import SecployConfig, LogLevel
+from lib import setup_logger, load_config, DEFAULT_CONFIG, secploy_logger
+from schemas import SecployConfig, LogLevel
 
 @dataclass
 class EventBatch:
@@ -105,7 +103,7 @@ class SecployClient:
             })
             return True
         except Exception as e:
-            log(f"Failed to queue event: {e}", self.debug)
+            secploy_logger.error(f"Failed to queue event: {e}", self.debug)
             return False
 
     def _send_batch(self, events: list) -> bool:
@@ -123,10 +121,10 @@ class SecployClient:
             try:
                 resp = requests.post(url, json={"events": events}, headers=self._headers(), timeout=5)
                 if resp.status_code == 200:
-                    log(f"Batch of {len(events)} events sent successfully", self.debug)
+                    secploy_logger.info(f"Batch of {len(events)} events sent successfully", self.debug)
                     return True
             except Exception as e:
-                log(f"Send batch failed: {e}", self.debug)
+                secploy_logger.error(f"Send batch failed: {e}", self.debug)
             time.sleep(1)
         return False
 
@@ -157,7 +155,7 @@ class SecployClient:
                         time.sleep(1)
 
             except Exception as e:
-                log(f"Error processing events: {e}", self.debug)
+                secploy_logger.error(f"Error processing events: {e}", self.debug)
 
     def _heartbeat_loop(self):
         """Send periodic heartbeats to the server."""
@@ -166,16 +164,16 @@ class SecployClient:
             try:
                 resp = requests.post(url, headers=self._headers(), timeout=5)
                 if resp.status_code == 200:
-                    log(f"Heartbeat sent successfully", self.debug)
+                    secploy_logger.info(f"Heartbeat sent successfully", self.debug)
                 else:
-                    log(f"Heartbeat failed with status {resp.status_code}", self.debug)
+                    secploy_logger.error(f"Heartbeat failed with status {resp.status_code}", self.debug)
             except Exception as e:
-                log(f"Heartbeat failed: {e}", self.debug)
+                secploy_logger.error(f"Heartbeat failed: {e}", self.debug)
             time.sleep(self.heartbeat_interval)
 
     def start(self):
         """Start the client's background threads for heartbeat and event processing."""
-        log("Starting Secploy client...", self.debug)
+        secploy_logger.info("Starting Secploy client...", self.debug)
         self._stop_event.clear()
         
         # Start heartbeat thread
@@ -196,7 +194,7 @@ class SecployClient:
 
     def stop(self):
         """Stop the client and wait for background threads to finish."""
-        log("Stopping Secploy client...", self.debug)
+        secploy_logger.info("Stopping Secploy client...", self.debug)
         self._stop_event.set()
         
         # Wait for threads to finish

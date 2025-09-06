@@ -1,7 +1,5 @@
 import logging
 
-logger = logging.getLogger(__name__)
-
 def setup_logger(log_level="INFO"):
     
     if log_level.upper() == "NONE":
@@ -19,4 +17,4 @@ def setup_logger(log_level="INFO"):
     )
     
 
-logger = logging.getLogger(__name__)
+secploy_logger = logging.getLogger(__name__)

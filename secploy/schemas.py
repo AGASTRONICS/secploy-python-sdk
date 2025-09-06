@@ -1,6 +1,6 @@
 from typing import TypedDict, Optional, Union
 
-from secploy.enums import LogLevel
+from enums import LogLevel
 
 
 class SecployConfig(TypedDict, total=False):
