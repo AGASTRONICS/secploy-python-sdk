@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "api_key": None,
+    "environment_key": None,
     "organization_id": None,
     "environment": "development",
     "sampling_rate": 1.0,

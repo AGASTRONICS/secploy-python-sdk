@@ -7,6 +7,7 @@ setup(
     install_requires=[
         "requests>=2.25.0",
         "pyyaml>=5.1",
+        "pydantic>=2.0.0",
     ],
     author="Agastronics",
     author_email="support@agastronics.com",

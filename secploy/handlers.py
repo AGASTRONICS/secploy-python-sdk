@@ -1,1 +1,0 @@
-# how do we make our secploy sdk capture their project logs and to our ingest_url/ingest endpoint    

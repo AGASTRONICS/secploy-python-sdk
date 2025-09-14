@@ -1,32 +1,31 @@
 import threading
-import time
+import logging
+from typing import Any, Dict, Optional, List, Union
 import queue
-from typing import Any, Dict, Optional
-import requests
-from dataclasses import dataclass, field
 
-from .lib import setup_logger, secploy_logger, load_config, DEFAULT_CONFIG
+from .lib import setup_logger, load_config, DEFAULT_CONFIG, secploy_logger
 from .schemas import SecployConfig, LogLevel
-
-@dataclass
-class EventBatch:
-    events: list = field(default_factory=list)
-    size: int = 0
-    last_flush: float = field(default_factory=time.time)
+from .log_capture import SecployLogCapturer
+from .events import EventHandler
+from .processor import EventProcessor
 
 class SecployClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
+        environment_key: Optional[str] = None,
         organization_id: Optional[str] = None,
         config_file: Optional[str] = None,
         config: Optional[SecployConfig] = DEFAULT_CONFIG,
+        log_levels: Optional[List[Union[str, int]]] = None
     ):
         """
         Initialize the Secploy client.
 
         Args:
             api_key: Optional API key to override configuration
+            environment_key: Optional Environment key to override configuration
+            organization_id: Optional Organization ID to override configuration
             config_file: Optional path to configuration file
             config: Configuration object, defaults to DEFAULT_CONFIG
         
@@ -44,6 +43,8 @@ class SecployClient:
         # Override api_key if provided directly
         if api_key:
             config.api_key = api_key
+        if environment_key:
+            config.environment_key = environment_key
         if organization_id:
             config.organization_id = organization_id
 
@@ -60,6 +61,8 @@ class SecployClient:
         # Validate required fields
         if not config.get('api_key'):
             raise ValueError("API key is required")
+        if not config.get('environment_key'):
+            raise ValueError("Environment key is required")
         if not config.get('organization_id'):
             raise ValueError("Organization ID is required")
         if not config.get('ingest_url'):
@@ -67,6 +70,7 @@ class SecployClient:
 
         # Set instance attributes from config
         self.api_key = config['api_key']
+        self.environment_key = config.get('environment_key')
         self.organization_id = config.get('organization_id')
         self.environment = config.get('environment', 'development')
         self.sampling_rate = config.get('sampling_rate', 1.0)
@@ -77,22 +81,57 @@ class SecployClient:
         self.log_level = config.get('log_level', 'INFO')
         
         # Batch processing configuration
-        self.batch_size = getattr(config, 'batch_size', 100)  # Max events per batch
-        self.flush_interval = getattr(config, 'flush_interval', 60)  # Max seconds between flushes
+        self.batch_size = config.get('batch_size', 100)  # Max events per batch
+        self.flush_interval = config.get('flush_interval', 60)  # Max seconds between flushes
 
         # Initialize internal state
-        self._stop_event = threading.Event()
-        self._thread = None
         self._event_queue = queue.Queue()
-        self._event_batch = EventBatch()
+        self._event_handler = EventHandler(self._event_queue)
+        
+        # Initialize event processor
+        self._event_processor = EventProcessor(
+            queue=self._event_queue,
+            ingest_url=self.ingest_url,
+            headers_callback=self._headers,
+            batch_size=self.batch_size,
+            flush_interval=self.flush_interval,
+            max_retry=self.max_retry
+        )
         
         # Setup logging
-        setup_logger(log_level=self.log_level)
+        if self.debug:
+            setup_logger(log_level=self.log_level)
         
+        # Initialize log capturer
+        self._log_capturer = SecployLogCapturer(self, levels=log_levels)
+    
+    def capture_logs(self, loggers: Union[str, List[str], None] = None):
+        """
+        Start capturing logs from specified loggers.
+        
+        Args:
+            loggers: Logger name(s) to capture. Can be:
+                    - None to capture the root logger
+                    - A string for a single logger
+                    - A list of logger names
+        """
+        self._log_capturer.start_capture(loggers)
+        secploy_logger.info(f"Started capturing logs from {loggers or 'root'}")
+        
+    def stop_capturing_logs(self, loggers: Union[str, List[str], None] = None):
+        """
+        Stop capturing logs from specified loggers.
+        
+        Args:
+            loggers: Logger name(s) to stop capturing
+        """
+        self._log_capturer.stop_capture(loggers)
+        secploy_logger.info(f"Stopped capturing logs from {loggers or 'root'}")
     
     def _headers(self):
         return {
             "X-API-Key": f"{self.api_key}",
+            "X-Environment-Key": f"{self.environment_key}",
             "X-Organization-ID": f"{self.organization_id}",
             "Content-Type": "application/json",
         }
@@ -108,115 +147,20 @@ class SecployClient:
         Returns:
             bool: True if event was queued successfully
         """
-        try:
-            self._event_queue.put({
-                "type": event_type,
-                "payload": payload,
-                "timestamp": time.time()
-            })
-            return True
-        except Exception as e:
-            secploy_logger.error(f"Failed to queue event: {e}")
-            return False
-
-    def _send_batch(self, events: list) -> bool:
-        """
-        Send a batch of events to the server.
-        
-        Args:
-            events: List of event dictionaries to send
-        
-        Returns:
-            bool: True if batch was sent successfully
-        """
-        url = f"{self.ingest_url}"
-        for attempt in range(self.max_retry):
-            try:
-                resp = requests.post(url, json={"events": events}, headers=self._headers(), timeout=5)
-                secploy_logger.debug(f"Send batch response: {resp.status_code} - {resp.text}")
-                if resp.status_code == 200:
-                    secploy_logger.info(f"Batch of {len(events)} events sent successfully")
-                    return True
-            except Exception as e:
-                secploy_logger.error(f"Send batch failed: {e}")
-            time.sleep(1)
-        return False
-
-    def _process_events(self):
-        """Process queued events and send them in batches."""
-        while not self._stop_event.is_set():
-            try:
-                # Get an event from the queue
-                try:
-                    event = self._event_queue.get(timeout=1)
-                    self._event_batch.events.append(event)
-                    self._event_batch.size += 1
-                except queue.Empty:
-                    pass
-
-                current_time = time.time()
-                should_flush = (
-                    self._event_batch.size >= self.batch_size or
-                    (self._event_batch.size > 0 and
-                     current_time - self._event_batch.last_flush >= self.flush_interval)
-                )
-
-                if should_flush:
-                    if self._send_batch(self._event_batch.events):
-                        self._event_batch = EventBatch()
-                    else:
-                        # If send fails, wait before retrying
-                        time.sleep(1)
-
-            except Exception as e:
-                secploy_logger.error(f"Error processing events: {e}")
-
-    def _heartbeat_loop(self):
-        """Send periodic heartbeats to the server."""
-        url = f"{self.ingest_url}/heartbeat"
-        while not self._stop_event.is_set():
-            try:
-                resp = requests.post(url, headers=self._headers(), timeout=5)
-                if resp.status_code == 200:
-                    secploy_logger.info(f"Heartbeat sent successfully")
-                else:
-                    secploy_logger.error(f"Heartbeat failed with status {resp.status_code}", self.debug)
-            except Exception as e:
-                secploy_logger.error(f"Heartbeat failed: {e}")
-            time.sleep(self.heartbeat_interval)
+        return self._event_handler.send_event(event_type, payload)
 
     def start(self):
-        """Start the client's background threads for heartbeat and event processing."""
+        """Start the client's event processing."""
         secploy_logger.info("Starting Secploy client...")
-        self._stop_event.clear()
-        
-        # Start heartbeat thread
-        # self._heartbeat_thread = threading.Thread(
-        #     target=self._heartbeat_loop,
-        #     name="secploy-heartbeat",
-        #     daemon=True
-        # )
-        # self._heartbeat_thread.start()
-        
-        # Start event processing thread
-        self._event_thread = threading.Thread(
-            target=self._process_events,
-            name="secploy-events",
-            daemon=True
-        )
-        self._event_thread.start()
+        self._event_processor.start()
 
     def stop(self):
-        """Stop the client and wait for background threads to finish."""
+        """Stop the client and wait for processing to finish."""
         secploy_logger.info("Stopping Secploy client...")
-        self._stop_event.set()
         
-        # Wait for threads to finish
-        # if self._heartbeat_thread:
-        #     self._heartbeat_thread.join(timeout=5)
-        if self._event_thread:
-            self._event_thread.join(timeout=5)
-            
-        # Flush any remaining events
-        if self._event_batch.events:
-            self._send_batch(self._event_batch.events)
+        # Stop all log capturing
+        if hasattr(self, '_log_capturer'):
+            self._log_capturer.stop_all()
+        
+        # Stop event processing
+        self._event_processor.stop()
