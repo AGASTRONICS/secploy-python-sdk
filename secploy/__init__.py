@@ -23,7 +23,7 @@ def cli():
     
     parser = argparse.ArgumentParser(description=__description__)
     parser.add_argument('--version', action='version', version=f'Secploy SDK v{__version__}')
-    parser.add_argument('--test-config', help='Test a configuration file', metavar='CONFIG_FILE')
+    parser.add_argument('--test-config', help='Test a configuration file: To verify if it is well configured', metavar='CONFIG_FILE')
     
     args = parser.parse_args()
     

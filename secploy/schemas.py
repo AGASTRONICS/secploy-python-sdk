@@ -1,6 +1,6 @@
 from typing import TypedDict, Optional, Union, List
 from datetime import datetime
-from pydantic import BaseModel, Extra
+from pydantic import BaseModel, ConfigDict
 from .enums import LogLevel
 
 
@@ -28,8 +28,7 @@ class Tags(BaseModel):
     service: str
     region: str
 
-    class Config:
-        extra = Extra.allow  # Allow additional fields in tags
+    model_config = ConfigDict(extra="allow")
 
 
 class Context(BaseModel):
@@ -40,6 +39,7 @@ class Context(BaseModel):
     http_status: int
     stacktrace: List[str]
     tags: Tags
+    
 
 
 class LogEntry(BaseModel):

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="secploy",
-    version="0.2.6",
+    version="0.2.7",
     packages=find_packages(),
     install_requires=[
         "requests>=2.25.0",

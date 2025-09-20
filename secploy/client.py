@@ -104,6 +104,8 @@ class SecployClient:
         
         # Initialize log capturer
         self._log_capturer = SecployLogCapturer(self, levels=log_levels)
+        
+        self.start()
     
     def capture_logs(self, loggers: Union[str, List[str], None] = None):
         """
