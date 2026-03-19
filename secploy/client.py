@@ -1,13 +1,16 @@
 import threading
 import logging
-from typing import Any, Dict, Optional, List, Union
+from typing import Any, Callable, Dict, Optional, List, Union
 import queue
+
+from secploy.lib.config import config_to_namespace
 
 from .lib import setup_logger, load_config, DEFAULT_CONFIG, secploy_logger
 from .schemas import SecployConfig, LogLevel
 from .log_capture import SecployLogCapturer
 from .events import EventHandler
 from .processor import EventProcessor
+from .config_manager import ConfigManager
 
 class SecployClient:
     def __init__(
@@ -34,8 +37,9 @@ class SecployClient:
             TypeError: If configuration values have invalid types
         """
         # Load config from file if provided else it will load from default locations or find .secploy
-        config = load_config(config_file)
-        
+        config_dict = load_config(config_file)
+        config = config_to_namespace(config_dict)
+
         if config is None:
             secploy_logger.error("No valid configuration found")
             return
@@ -49,40 +53,42 @@ class SecployClient:
             config.organization_id = organization_id
 
         # Special handling for log_level if it's a string
-        if isinstance(config.get('log_level'), str):
+        log_level = getattr(config, 'log_level', None)
+        if isinstance(log_level, str):
             try:
-                config['log_level'] = LogLevel(config['log_level'].upper())
+                setattr(config, 'log_level', LogLevel(log_level.upper()))
             except ValueError:
                 raise ValueError(
-                    f"Invalid log level: {config.get('log_level')}. Must be one of: "
+                    f"Invalid log level: {log_level}. Must be one of: "
                     f"{', '.join(level.value for level in LogLevel)}"
                 )
 
         # Validate required fields
-        if not config.get('api_key'):
+        if not getattr(config, 'api_key', None):
             raise ValueError("API key is required")
-        if not config.get('environment_key'):
+        if not getattr(config, 'environment_key', None):
             raise ValueError("Environment key is required")
-        if not config.get('organization_id'):
+        if not getattr(config, 'organization_id', None):
             raise ValueError("Organization ID is required")
-        if not config.get('ingest_url'):
+        if not getattr(config, 'ingest_url', None):
             raise ValueError("Ingest URL is required")
 
         # Set instance attributes from config
-        self.api_key = config['api_key']
-        self.environment_key = config.get('environment_key')
-        self.organization_id = config.get('organization_id')
-        self.environment = config.get('environment', 'development')
-        self.sampling_rate = config.get('sampling_rate', 1.0)
-        self.ingest_url = config['ingest_url'].rstrip("/")
-        self.heartbeat_interval = config.get('heartbeat_interval', 60)
-        self.max_retry = config.get('max_retry', 5)
-        self.debug = config.get('debug', False)
-        self.log_level = config.get('log_level', 'INFO')
-        
+        self.api_key = getattr(config, 'api_key')
+        self.environment_key = getattr(config, 'environment_key', None)
+        self.organization_id = getattr(config, 'organization_id', None)
+        self.environment = getattr(config, 'environment', 'development')
+        self.sampling_rate = getattr(config, 'sampling_rate', 1.0)
+        self.ingest_url = getattr(config, 'ingest_url').rstrip("/")
+        self.api_url = getattr(config, 'api_url', 'https://api.secploy.com').rstrip("/")
+        self.heartbeat_interval = getattr(config, 'heartbeat_interval', 60)
+        self.max_retry = getattr(config, 'max_retry', 5)
+        self.debug = getattr(config, 'debug', False)
+        self.log_level = getattr(config, 'log_level', 'INFO')
+
         # Batch processing configuration
-        self.batch_size = config.get('batch_size', 100)  # Max events per batch
-        self.flush_interval = config.get('flush_interval', 60)  # Max seconds between flushes
+        self.batch_size = getattr(config, 'batch_size', 100)  # Max events per batch
+        self.flush_interval = getattr(config, 'flush_interval', 60)  # Max seconds between flushes
 
         # Initialize internal state
         self._event_queue = queue.Queue()
@@ -104,7 +110,13 @@ class SecployClient:
         
         # Initialize log capturer
         self._log_capturer = SecployLogCapturer(self, levels=log_levels)
-        
+
+        # Config manager (env vars, secrets, feature flags)
+        self.configs = ConfigManager(
+            api_url=self.api_url,
+            headers_callback=self._headers,
+        )
+
         self.start()
     
     def capture_logs(self, loggers: Union[str, List[str], None] = None):
@@ -160,6 +172,10 @@ class SecployClient:
         """Stop the client and wait for processing to finish."""
         secploy_logger.info("Stopping Secploy client...")
         
+        # Stop config auto-refresh if running
+        if self.configs.is_refreshing:
+            self.configs.stop_refresh()
+
         # Stop all log capturing
         if hasattr(self, '_log_capturer'):
             self._log_capturer.stop_all()

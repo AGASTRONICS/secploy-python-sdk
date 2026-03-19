@@ -6,7 +6,7 @@ from .client import SecployClient
 from .schemas import SecployConfig
 from .schemas import LogLevel
 
-__version__ = "0.2.5"
+__version__ = "0.2.9"
 __author__ = "Agastronics"
 __email__ = "support@agastronics.com"
 __description__ = "Event tracking and monitoring SDK for Python applications"

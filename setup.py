@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="secploy",
-    version="0.2.7",
+    version="0.2.9",
     packages=find_packages(),
     install_requires=[
         "requests>=2.25.0",
@@ -10,7 +10,7 @@ setup(
         "pydantic>=2.0.0",
     ],
     author="Agastronics",
-    author_email="support@agastronics.com",
+    author_email="support@secploy.com",
     description="Event tracking and monitoring SDK for Python applications",
     long_description=open("README.md").read() if open("README.md") else "",
     long_description_content_type="text/markdown",

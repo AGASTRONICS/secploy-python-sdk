@@ -11,6 +11,7 @@ import os    # For path checks
 import glob  # For finding config files
 import logging
 from typing import Dict, Optional, Union
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ DEFAULT_CONFIG = {
     "max_retry": 5,
     "debug": False,
     "ingest_url": "https://ingest.secploy.com",
+    "api_url": "https://api.secploy.com",
 }
 
 def find_project_config() -> Optional[str]:
@@ -159,6 +161,12 @@ def load_config(file_path: Optional[str] = None) -> Dict[str, Union[str, int, fl
             logger.warning("No API key provided. Secploy will be disabled.")
             
     return config
+
+def config_to_namespace(config: Dict[str, Union[str, int, float, bool, None]]) -> SimpleNamespace:
+    """
+    Converts a config dict to an object with attribute access.
+    """
+    return SimpleNamespace(**config)
 
 
 def validate_config(config: Dict[str, Union[str, int, float, bool, None]]) -> bool:

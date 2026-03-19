@@ -10,6 +10,7 @@ class SecployConfig(TypedDict, total=False):
     organization_id: str
     environment: str
     ingest_url: str
+    api_url: str
     heartbeat_interval: int
     max_retry: int
     debug: bool
