@@ -1,4 +1,4 @@
-from typing import TypedDict, Optional, Union, List
+from typing import Any, Dict, TypedDict, Optional, Union, List
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict
 from .enums import LogLevel
@@ -22,6 +22,42 @@ class SecployConfig(TypedDict, total=False):
     retry_attempts: int
     ignore_errors: bool
     source_root: Optional[str]
+
+
+class SecurityControlActionRequest(TypedDict, total=False):
+    action_type: str
+    target_type: str
+    target: str
+    reason: str
+    identity_key: str
+    session_id: str
+    auth_provider: str
+    risk_score: float
+    expires_at: str
+    metadata: Dict[str, Any]
+
+
+class SecurityGateAuthContext(TypedDict, total=False):
+    identity_key: str
+    session_id: str
+    auth_provider: str
+    authorization_scheme: str
+    user_id: str
+    remote_addr: str
+
+
+class SecurityGateDecision(TypedDict, total=False):
+    allowed: bool
+    blocked: bool
+    method: str
+    endpoint: str
+    url: str
+    reason: str
+    rule: Dict[str, Any]
+    controls: List[Dict[str, Any]]
+    auth: SecurityGateAuthContext
+    metadata: Dict[str, Any]
+    raw: Dict[str, Any]
 
 
 class Tags(BaseModel):

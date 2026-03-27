@@ -130,7 +130,7 @@ class SecployLogCapturer:
             )
         )
         payload = log_entry.model_dump(mode="json")
-        self.client._event_queue.put(("log", payload))
+        self.client.send_event("error", payload)
 
 
 class SecployLogHandler(logging.Handler):
@@ -198,8 +198,8 @@ class SecployLogHandler(logging.Handler):
                 message=self.format(record),
                 context=context
             )
-            payload = log_entry.model_dump(mode="json") 
-            self._event_handler.send_event('log', payload)
+            payload = log_entry.model_dump(mode="json")
+            self._event_handler.send_event("log", payload)
 
         except Exception as e:
             # Avoid infinite recursion by using sys.stderr

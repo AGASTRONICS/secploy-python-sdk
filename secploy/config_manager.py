@@ -4,6 +4,7 @@ from typing import Callable, Dict, Optional
 import requests
 
 from .lib import secploy_logger
+from .realtime import ConfigRealtime
 
 
 class ConfigManager:
@@ -22,6 +23,7 @@ class ConfigManager:
         self._lock = threading.Lock()
         self._refresh_thread: Optional[threading.Thread] = None
         self._refresh_stop = threading.Event()
+        self._realtime: Optional[ConfigRealtime] = None
 
     # ------------------------------------------------------------------
     # Core fetch
@@ -145,3 +147,39 @@ class ConfigManager:
     @property
     def is_refreshing(self) -> bool:
         return bool(self._refresh_thread and self._refresh_thread.is_alive())
+
+    # ------------------------------------------------------------------
+    # Real-time / WebSocket delivery
+    # ------------------------------------------------------------------
+
+    def start_realtime(self, ws_url: str, headers_callback: Callable[[], Dict[str, str]]) -> None:
+        """
+        Start a WebSocket connection that pushes config updates in real time.
+        Falls back to 15 s polling automatically when the socket is down.
+
+        Args:
+            ws_url:           Full WebSocket URL, e.g. ``wss://api.secploy.com/ws/sdk/configs/``.
+            headers_callback: Callable that returns the current auth headers dict.
+        """
+        if self._realtime is not None:
+            secploy_logger.warning("Config real-time is already running.")
+            return
+
+        self._realtime = ConfigRealtime(
+            ws_url=ws_url,
+            headers_callback=headers_callback,
+            on_update=self.fetch,
+        )
+        self._realtime.start()
+
+    def stop_realtime(self) -> None:
+        """Stop the WebSocket connection (and any polling fallback)."""
+        if self._realtime is not None:
+            self._realtime.stop()
+            self._realtime = None
+            secploy_logger.info("Config real-time stopped.")
+
+    @property
+    def is_realtime(self) -> bool:
+        """True while a WebSocket connection is open."""
+        return self._realtime is not None and self._realtime.is_connected
