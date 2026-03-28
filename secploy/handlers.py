@@ -319,6 +319,98 @@ class SecployGate:
 			self._track_decision(decision)
 
 		return decision
+	
+	# Function monitoring registry
+	_registered_functions: Dict[str, Callable] = {}
+
+	def register_function(self, fn: Callable) -> Callable:
+		"""Register and wrap a function for monitoring and control, and emit an event on execution."""
+		from functools import wraps
+		fn_name = fn.__qualname__
+		self._registered_functions[fn_name] = fn
+
+		@wraps(fn)
+		def wrapper(*args, **kwargs):
+			# Gate check before function execution
+			self(
+				request={
+					'method': 'FUNCTION',
+					'endpoint': fn_name,
+					'metadata': {'type': 'function', 'args': args, 'kwargs': kwargs},
+				}
+			)
+			# Build function execution event payload
+			import time
+			import sys
+			from inspect import signature
+			start_time = time.time()
+			exc_info = None
+			result = None
+			try:
+				result = fn(*args, **kwargs)
+				return result
+			except Exception as exc:
+				exc_info = {
+					"type": type(exc).__name__,
+					"message": str(exc),
+				}
+				raise
+			finally:
+				duration = time.time() - start_time
+				# Try to get argument names and values
+				try:
+					sig = signature(fn)
+					bound = sig.bind(*args, **kwargs)
+					bound.apply_defaults()
+					arg_map = dict(bound.arguments)
+				except Exception:
+					arg_map = {}
+				payload = {
+					"function": fn_name,
+					"module": fn.__module__,
+					"qualname": fn.__qualname__,
+					"args": args,
+					"kwargs": kwargs,
+					"arg_map": arg_map,
+					"result_type": type(result).__name__ if result is not None else None,
+					"exception": exc_info,
+					"duration": duration,
+					"timestamp": start_time,
+					"context": {
+						"type": "function_execution",
+						"function": fn_name,
+						"module": fn.__module__,
+						"args": args,
+						"kwargs": kwargs,
+						"arg_map": arg_map,
+						"duration": duration,
+						"exception": exc_info,
+					},
+					"message": f"Function {fn_name} executed in {duration:.4f}s" + (f" with exception: {exc_info['type']}" if exc_info else ""),
+				}
+				try:
+					self.client.send_event(
+						event_type="function_execution",
+						payload=payload
+					)
+				except Exception as exc:
+					secploy_logger.warning(f"Failed to emit function execution event for {fn_name}: {exc}")
+		return wrapper
+
+	def monitor(self, fn: Callable) -> Callable:
+		"""Decorator to monitor a function."""
+		return self.register_function(fn)
+
+	def sync_function_registry(self):
+		"""Send the list of registered functions to the backend for control/visibility."""
+		function_names = list(self._registered_functions.keys())
+		try:
+			self.client.send_event(
+				event_type="function_registry",
+				payload={"functions": function_names}
+			)
+		except Exception as exc:
+			secploy_logger.warning(f"Failed to sync function registry: {exc}")
 
 	def _track_decision(self, decision: SecurityGateDecision) -> None:
 		signal_context = self._extract_security_signals(decision)

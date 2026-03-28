@@ -2,12 +2,14 @@
 Secploy SDK - Event ingestion, log capture, realtime config sync, and security gating for Python applications
 """
 
+
 from .client import SecployClient
 from .gates import GateDecision, GateRequest, SecurityGateException
 from .handlers import SecployGate, SecurityGateBlocked, SecploySessionAdapter
 from .schemas import SecployConfig
 from .schemas import LogLevel
 from .system_metrics import SystemMetricsCollector
+from .register import SecployRegister
 
 __version__ = "1.0.0"
 __author__ = "Abdulsamad .O. Abdulganiy"
@@ -25,6 +27,7 @@ __all__ = [
     "SecployConfig",
     "LogLevel",
     "SystemMetricsCollector",
+    "SecployRegister",
 ]
 
 

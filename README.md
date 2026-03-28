@@ -98,6 +98,77 @@ var_a = client.env.var_a
 client.stop()
 ```
 
+
+## Function Monitoring & Telemetry
+
+Secploy lets you monitor and control specific Python functions, emitting rich telemetry for every invocation. This enables security, audit, and analytics use cases.
+
+### Usage
+
+```python
+from secploy import SecployGate
+
+gate = SecployGate()
+
+# Register and monitor a function
+@gate.monitor
+def protected_function(x, y):
+        return x + y
+
+protected_function(1, 2)  # Checked and tracked
+
+# Or register dynamically
+monitored = gate.register_function(lambda a, b: a * b)
+monitored(3, 4)
+```
+
+### What Happens
+- Before each function call, SecployGate checks security policy (can block or allow).
+- After execution, a `function_execution` event is emitted with full telemetry.
+
+### Telemetry Fields
+Each function execution event includes:
+- `function`: Qualified function name
+- `module`: Module name
+- `args`, `kwargs`: Arguments passed
+- `arg_map`: Argument names and values
+- `result_type`: Type of return value
+- `exception`: Exception info (if any)
+- `duration`: Execution time (seconds)
+- `timestamp`: Start time
+- `context`: All above, plus event type and extra context
+- `message`: Human-readable summary
+
+Example event payload:
+```json
+{
+    "function": "my_module.protected_function",
+    "module": "my_module",
+    "args": [1, 2],
+    "kwargs": {},
+    "arg_map": {"x": 1, "y": 2},
+    "result_type": "int",
+    "exception": null,
+    "duration": 0.0002,
+    "timestamp": 1711640000.123,
+    "context": {
+        "type": "function_execution",
+        "function": "my_module.protected_function",
+        "module": "my_module",
+        "args": [1, 2],
+        "kwargs": {},
+        "arg_map": {"x": 1, "y": 2},
+        "duration": 0.0002,
+        "exception": null
+    },
+    "message": "Function my_module.protected_function executed in 0.0002s"
+}
+```
+
+You can use this for audit, analytics, or real-time security enforcement.
+
+---
+
 ## Security Gate
 
 If you want Secploy to evaluate requests before your application or HTTP client executes them, use `SecployGate`.
