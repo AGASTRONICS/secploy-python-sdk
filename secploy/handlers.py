@@ -343,7 +343,9 @@ class SecployGate:
 			import time
 			import sys
 			from inspect import signature
+			from datetime import datetime, timezone
 			start_time = time.time()
+			start_time_iso = datetime.fromtimestamp(start_time, tz=timezone.utc).isoformat()
 			exc_info = None
 			result = None
 			try:
@@ -374,8 +376,8 @@ class SecployGate:
 					"arg_map": arg_map,
 					"result_type": type(result).__name__ if result is not None else None,
 					"exception": exc_info,
-					"duration": duration,
-					"timestamp": start_time,
+					"duration": f"{duration:.6f}",
+					"timestamp": start_time_iso,
 					"context": {
 						"type": "function_execution",
 						"function": fn_name,
@@ -383,7 +385,7 @@ class SecployGate:
 						"args": args,
 						"kwargs": kwargs,
 						"arg_map": arg_map,
-						"duration": duration,
+						"duration": f"{duration:.6f}",
 						"exception": exc_info,
 					},
 					"message": f"Function {fn_name} executed in {duration:.4f}s" + (f" with exception: {exc_info['type']}" if exc_info else ""),
