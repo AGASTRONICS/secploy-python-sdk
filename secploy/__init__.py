@@ -11,7 +11,7 @@ from .schemas import LogLevel
 from .system_metrics import SystemMetricsCollector
 from .register import SecployRegister
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 __author__ = "Abdulsamad .O. Abdulganiy"
 __email__ = "support@secploy.com"
 __description__ = "Event ingestion, log capture, realtime config sync, and security gating SDK for Python applications"

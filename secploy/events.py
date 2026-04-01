@@ -31,6 +31,7 @@ class EventHandler:
         "system_metrics",
         "function_execution",
         "function_registry",
+        "dependency_health_report",
     }
 
     def _normalize_event_type(self, value: Optional[str]) -> Optional[str]:

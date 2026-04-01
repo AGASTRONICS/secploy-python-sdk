@@ -24,6 +24,11 @@ class SecployConfig(TypedDict, total=False):
     source_root: Optional[str]
     instrument_outbound_requests: bool
     instrument_httpx_async: bool
+    auto_dependency_report: bool
+    dependency_report_limit: int
+    dependency_report_incidents_limit: int
+    dependency_report_include_current_issues: bool
+    dependency_report_include_latest_issues: bool
 
 
 class SecurityControlActionRequest(TypedDict, total=False):
@@ -60,6 +65,42 @@ class SecurityGateDecision(TypedDict, total=False):
     auth: SecurityGateAuthContext
     metadata: Dict[str, Any]
     raw: Dict[str, Any]
+
+
+class DependencyIssue(TypedDict, total=False):
+    id: str
+    summary: str
+    details: str
+    published: str
+    modified: str
+    aliases: List[str]
+    severity: List[Dict[str, Any]]
+    references: List[Dict[str, Any]]
+
+
+class DependencyHealthItem(TypedDict, total=False):
+    name: str
+    current_version: str
+    latest_version: Optional[str]
+    is_outdated: bool
+    latest_check_error: Optional[str]
+    has_current_issues: bool
+    current_issue_count: int
+    has_latest_issues: bool
+    latest_issue_count: int
+    recent_incidents: List[DependencyIssue]
+
+
+class DependencyHealthSummary(TypedDict, total=False):
+    total_dependencies: int
+    outdated_dependencies: int
+    dependencies_with_current_issues: int
+    dependencies_with_latest_issues: int
+
+
+class DependencyHealthReport(TypedDict, total=False):
+    summary: DependencyHealthSummary
+    dependencies: List[DependencyHealthItem]
 
 
 class Tags(BaseModel):

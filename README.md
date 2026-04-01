@@ -13,6 +13,10 @@ Secploy Python SDK provides event ingestion, structured log capture, runtime con
   - [Highlights](#highlights)
   - [Installation](#installation)
   - [Quick Start](#quick-start)
+  - [Function Monitoring \& Telemetry](#function-monitoring--telemetry)
+    - [Usage](#usage)
+    - [What Happens](#what-happens)
+    - [Telemetry Fields](#telemetry-fields)
   - [Security Gate](#security-gate)
   - [Runnable Example](#runnable-example)
   - [CLI](#cli)
@@ -31,6 +35,7 @@ Secploy Python SDK provides event ingestion, structured log capture, runtime con
     - [Basic Usage](#basic-usage)
     - [Authentication](#authentication)
     - [Safe Defaults](#safe-defaults)
+  - [Dependency Health Insights](#dependency-health-insights)
   - [API Surface](#api-surface)
     - [SecployClient](#secployclient)
     - [ConfigManager](#configmanager)
@@ -591,6 +596,33 @@ if client.endpoint_blocked(method='POST', endpoint='/api/billing/charge'):
 - All errors are logged but don't raise exceptions
 - Uses your organization ID automatically from client configuration
 
+## Dependency Health Insights
+
+Secploy now does this automatically.
+
+When `SecployClient()` starts, the SDK builds a dependency health report,
+then sends it through ingest as a `dependency_health_report` event so it can
+be shown in frontend dashboards without extra SDK code.
+
+This keeps usage simple: initialize once and Secploy handles the rest.
+
+```python
+from secploy import SecployClient
+
+client = SecployClient()
+# No manual dependency report call required.
+```
+
+If needed, you can disable automatic dependency reporting:
+
+```yaml
+auto_dependency_health_report: false
+```
+
+Frontend and backend teams can use the canonical event schema here:
+
+- [Dependency Health Report Event Contract](docs/dependency-health-report-event.md)
+
 ## API Surface
 
 ### SecployClient
@@ -610,6 +642,10 @@ if client.endpoint_blocked(method='POST', endpoint='/api/billing/charge'):
   - Returns created/executed action statuses from backend
 - `submit_security_control_action(action_type: str, target_type: str, target: str, ..., timeout: int = 5) -> dict`
   - Convenience wrapper for sending a single control action
+- `dependency_health_report(limit: int | None = None, include_current_issues: bool = True, include_latest_issues: bool = True, incidents_limit: int = 3, timeout: int = 8) -> dict`
+    Returns dependency version drift plus issue and recent incident-like records from OSV.
+- `emit_dependency_health_report(limit: int = 20, incidents_limit: int = 5, timeout: int = 8) -> bool`
+    Sends dependency health report through ingest as a `dependency_health_report` event.
 - `enable_requests_instrumentation() -> bool`
 - `disable_requests_instrumentation() -> None`
 - `enable_httpx_instrumentation(include_async: bool = True) -> bool`

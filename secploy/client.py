@@ -1,7 +1,7 @@
 import threading
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, List, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, List, Union, Tuple
 import queue
 import requests
 from urllib.parse import urlsplit
@@ -10,6 +10,10 @@ from secploy.lib.config import config_to_namespace
 
 from .lib import setup_logger, load_config, DEFAULT_CONFIG, secploy_logger
 from .schemas import (
+    DependencyHealthItem,
+    DependencyHealthReport,
+    DependencyHealthSummary,
+    DependencyIssue,
     LogLevel,
     SecployConfig,
     SecurityControlActionRequest,
@@ -138,6 +142,9 @@ class SecployClient:
             getattr(config, 'instrument_outbound_requests', True)
         )
         self.instrument_httpx_async = bool(getattr(config, 'instrument_httpx_async', True))
+        self.auto_dependency_health_report = bool(
+            getattr(config, 'auto_dependency_health_report', True)
+        )
 
         # Batch processing configuration
         self.batch_size = getattr(config, 'batch_size', 100)  # Max events per batch
@@ -819,6 +826,285 @@ class SecployClient:
 
         return self.submit_security_control_actions([action], timeout=timeout)
 
+    def _list_installed_dependencies(self) -> List[Tuple[str, str]]:
+        """
+        Return installed distributions as (name, version) pairs sorted by name.
+        """
+        try:
+            from importlib import metadata as importlib_metadata  # noqa: PLC0415
+        except Exception as exc:
+            secploy_logger.warning(f"Unable to inspect installed dependencies: {exc}")
+            return []
+
+        discovered: Dict[str, str] = {}
+        for dist in importlib_metadata.distributions():
+            raw_name = dist.metadata.get("Name")
+            version = dist.version
+            if not raw_name or not version:
+                continue
+            normalized_name = str(raw_name).strip()
+            if not normalized_name:
+                continue
+            discovered[normalized_name] = str(version).strip()
+
+        return sorted(discovered.items(), key=lambda item: item[0].lower())
+
+    def _is_outdated_version(self, current_version: str, latest_version: str) -> bool:
+        """
+        Compare versions with packaging when available, fallback to string compare.
+        """
+        if not latest_version:
+            return False
+        try:
+            from packaging.version import Version  # noqa: PLC0415
+
+            return Version(str(current_version)) < Version(str(latest_version))
+        except Exception:
+            return str(current_version) != str(latest_version)
+
+    def _fetch_pypi_latest_version(
+        self,
+        package_name: str,
+        timeout: int,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Fetch latest package version from PyPI.
+        """
+        url = f"https://pypi.org/pypi/{package_name}/json"
+        try:
+            response = requests.get(url, timeout=timeout)
+        except requests.RequestException as exc:
+            return None, f"network_error: {exc}"
+
+        if response.status_code == 404:
+            return None, "not_found_on_pypi"
+        if response.status_code < 200 or response.status_code >= 300:
+            return None, f"http_{response.status_code}"
+
+        try:
+            payload = response.json()
+        except Exception:
+            return None, "invalid_pypi_json"
+
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            return None, "invalid_pypi_payload"
+        latest_version = info.get("version")
+        if not isinstance(latest_version, str) or not latest_version.strip():
+            return None, "missing_latest_version"
+        return latest_version.strip(), None
+
+    def _normalize_osv_issue(self, issue: Dict[str, Any]) -> DependencyIssue:
+        return {
+            "id": str(issue.get("id") or ""),
+            "summary": str(issue.get("summary") or ""),
+            "details": str(issue.get("details") or ""),
+            "published": str(issue.get("published") or ""),
+            "modified": str(issue.get("modified") or ""),
+            "aliases": [str(alias) for alias in issue.get("aliases") or []],
+            "severity": [
+                severity
+                for severity in (issue.get("severity") or [])
+                if isinstance(severity, dict)
+            ],
+            "references": [
+                reference
+                for reference in (issue.get("references") or [])
+                if isinstance(reference, dict)
+            ],
+        }
+
+    def _fetch_osv_issues(
+        self,
+        package_name: str,
+        version: str,
+        timeout: int,
+    ) -> Tuple[List[DependencyIssue], Optional[str]]:
+        """
+        Fetch OSV issues for a package version.
+        """
+        query = {
+            "package": {
+                "name": package_name,
+                "ecosystem": "PyPI",
+            },
+            "version": version,
+        }
+        try:
+            response = requests.post("https://api.osv.dev/v1/query", json=query, timeout=timeout)
+        except requests.RequestException as exc:
+            return [], f"network_error: {exc}"
+
+        if response.status_code < 200 or response.status_code >= 300:
+            return [], f"http_{response.status_code}"
+
+        try:
+            payload = response.json()
+        except Exception:
+            return [], "invalid_osv_json"
+
+        raw_issues = payload.get("vulns") or []
+        if not isinstance(raw_issues, list):
+            return [], "invalid_osv_payload"
+
+        normalized = [
+            self._normalize_osv_issue(issue)
+            for issue in raw_issues
+            if isinstance(issue, dict)
+        ]
+        normalized.sort(
+            key=lambda issue: (issue.get("modified") or issue.get("published") or ""),
+            reverse=True,
+        )
+        return normalized, None
+
+    def dependency_health_report(
+        self,
+        limit: Optional[int] = None,
+        include_current_issues: bool = True,
+        include_latest_issues: bool = True,
+        incidents_limit: int = 3,
+        timeout: int = 8,
+    ) -> DependencyHealthReport:
+        """
+        Inspect installed dependencies and return version/issue health insight.
+
+        The report includes:
+        - installed version for each dependency
+        - latest available version on PyPI
+        - whether the dependency is outdated
+        - issue counts (via OSV) for current and latest versions
+        - recent issue records as incident-like entries
+        """
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be >= 1 when provided")
+        if incidents_limit < 0:
+            raise ValueError("incidents_limit must be >= 0")
+
+        dependencies = self._list_installed_dependencies()
+        if limit is not None:
+            dependencies = dependencies[:limit]
+
+        items: List[DependencyHealthItem] = []
+
+        for package_name, current_version in dependencies:
+            latest_version, latest_error = self._fetch_pypi_latest_version(
+                package_name=package_name,
+                timeout=timeout,
+            )
+            is_outdated = (
+                self._is_outdated_version(current_version, latest_version)
+                if latest_version
+                else False
+            )
+
+            current_issues: List[DependencyIssue] = []
+            latest_issues: List[DependencyIssue] = []
+
+            if include_current_issues:
+                current_issues, _ = self._fetch_osv_issues(
+                    package_name=package_name,
+                    version=current_version,
+                    timeout=timeout,
+                )
+            if include_latest_issues and latest_version:
+                latest_issues, _ = self._fetch_osv_issues(
+                    package_name=package_name,
+                    version=latest_version,
+                    timeout=timeout,
+                )
+
+            merged_recent: List[DependencyIssue] = []
+            seen_issue_ids = set()
+            for issue in current_issues + latest_issues:
+                issue_id = issue.get("id") or ""
+                if issue_id in seen_issue_ids:
+                    continue
+                seen_issue_ids.add(issue_id)
+                merged_recent.append(issue)
+
+            merged_recent.sort(
+                key=lambda issue: (issue.get("modified") or issue.get("published") or ""),
+                reverse=True,
+            )
+
+            item: DependencyHealthItem = {
+                "name": package_name,
+                "current_version": current_version,
+                "latest_version": latest_version,
+                "is_outdated": is_outdated,
+                "latest_check_error": latest_error,
+                "has_current_issues": len(current_issues) > 0,
+                "current_issue_count": len(current_issues),
+                "has_latest_issues": len(latest_issues) > 0,
+                "latest_issue_count": len(latest_issues),
+                "recent_incidents": merged_recent[:incidents_limit],
+            }
+            items.append(item)
+
+        summary: DependencyHealthSummary = {
+            "total_dependencies": len(items),
+            "outdated_dependencies": sum(1 for item in items if item.get("is_outdated")),
+            "dependencies_with_current_issues": sum(
+                1 for item in items if item.get("has_current_issues")
+            ),
+            "dependencies_with_latest_issues": sum(
+                1 for item in items if item.get("has_latest_issues")
+            ),
+        }
+        return {
+            "summary": summary,
+            "dependencies": items,
+        }
+
+    def emit_dependency_health_report(
+        self,
+        limit: int = 20,
+        incidents_limit: int = 5,
+        timeout: int = 8,
+    ) -> bool:
+        """
+        Build dependency health insights and send them through ingest as an event.
+
+        This keeps frontend visibility aligned with the same ingest/event pipeline.
+        """
+        try:
+            report = self.dependency_health_report(
+                limit=limit,
+                incidents_limit=incidents_limit,
+                include_current_issues=True,
+                include_latest_issues=True,
+                timeout=timeout,
+            )
+            payload: Dict[str, Any] = {
+                "name": "dependency_health_report",
+                "message": "Dependency health report generated",
+                "context": {
+                    "type": "dependency_health_report",
+                    "source": "secploy-python-sdk",
+                    "summary": report.get("summary", {}),
+                    "dependencies": report.get("dependencies", []),
+                },
+            }
+            return self.send_event("dependency_health_report", payload)
+        except Exception as exc:
+            secploy_logger.warning(f"Failed to emit dependency health report: {exc}")
+            return False
+
+    def _emit_dependency_health_report_async(self) -> None:
+        """Emit dependency report in background so startup stays responsive."""
+
+        def _worker() -> None:
+            # Small delay gives app startup and event processor time to settle.
+            time.sleep(1.0)
+            self.emit_dependency_health_report()
+
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name="secploy-dependency-health-report",
+        ).start()
+
     def start(self):
         """Start the client's event processing and real-time config delivery."""
         secploy_logger.info("Starting Secploy client...")
@@ -828,6 +1114,9 @@ class SecployClient:
         if self.instrument_outbound_requests:
             self.enable_requests_instrumentation()
             self.enable_httpx_instrumentation(include_async=self.instrument_httpx_async)
+
+        if self.auto_dependency_health_report:
+            self._emit_dependency_health_report_async()
 
         if self.realtime:
             ws_url = (

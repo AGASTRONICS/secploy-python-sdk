@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
     "api_url": "https://api.secploy.com",
     "instrument_outbound_requests": True,
     "instrument_httpx_async": True,
+    "auto_dependency_health_report": True,
 }
 
 def find_project_config() -> Optional[str]:
