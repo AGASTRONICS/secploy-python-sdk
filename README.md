@@ -235,6 +235,37 @@ response = secured_session.post(
 )
 ```
 
+Outbound calls made through `secploy_gate.request(...)` or `client.security_session(...)`
+also emit dependency telemetry automatically, including the destination host,
+scheme, path, status code, and duration. Those events can be visualized in the
+Secploy project graph as external service dependencies.
+
+By default, `SecployClient` also instruments outbound calls from `requests`
+automatically (without requiring `SecployGate`) so your project can discover
+external dependencies from normal runtime traffic.
+
+If your application uses `httpx` directly and you disabled auto instrumentation,
+you can enable runtime instrumentation manually:
+
+```python
+client.enable_httpx_instrumentation()
+```
+
+You can also toggle `requests` instrumentation explicitly:
+
+```python
+client.enable_requests_instrumentation()
+client.disable_requests_instrumentation()
+```
+
+To skip dependency telemetry for a specific outbound call, pass
+`secploy_track_outbound=False`:
+
+```python
+requests.get("https://internal.example.com/health", secploy_track_outbound=False)
+httpx.get("https://internal.example.com/health", secploy_track_outbound=False)
+```
+
 When blocked, `SecurityGateBlocked` now includes richer context:
 
 - `exc.reason`
@@ -424,6 +455,8 @@ Configuration precedence (highest first):
 | `debug` | `bool` | `false` | Enables SDK debug logging |
 | `source_root` | `str` | `None` | Optional source root metadata |
 | `realtime` | `bool` | `true` | Enable/disable realtime config stream |
+| `instrument_outbound_requests` | `bool` | `true` | Auto-capture outbound `requests`/`httpx` telemetry |
+| `instrument_httpx_async` | `bool` | `true` | Include `httpx.AsyncClient` instrumentation |
 
 ### Environment Variables
 
@@ -564,6 +597,7 @@ if client.endpoint_blocked(method='POST', endpoint='/api/billing/charge'):
 
 - `send_event(event_type: str, payload: dict) -> bool`
 - `track_http_request(method: str, endpoint: str, status_code: int, message: str | None = None, context: dict | None = None) -> bool`
+- `track_external_service_request(method: str, url: str, status_code: int | None = None, message: str | None = None, context: dict | None = None, duration_ms: float | None = None, error: Exception | None = None) -> bool`
 - `track_error(error: Exception, endpoint: str | None = None, method: str | None = None, status_code: int = 500, context: dict | None = None) -> bool`
 - `track_metric(name: str, value: int | float, unit: str | None = None, tags: dict | None = None, context: dict | None = None, message: str | None = None) -> bool`
 - `endpoint_blocked(method: str, endpoint: str) -> bool`
@@ -572,10 +606,14 @@ if client.endpoint_blocked(method='POST', endpoint='/api/billing/charge'):
   - Returns `True` if blocked, `False` if not blocked or on error (safe default)
     - Uses the client's configured `api_key`, `environment_key`, and `organization_id` headers
 - `submit_security_control_actions(actions: list[dict], timeout: int = 5) -> dict`
-    - Submit one or more post-auth security control actions via API-key authenticated ingest endpoint
-    - Returns created/executed action statuses from backend
+  - Submit one or more post-auth security control actions via API-key authenticated ingest endpoint
+  - Returns created/executed action statuses from backend
 - `submit_security_control_action(action_type: str, target_type: str, target: str, ..., timeout: int = 5) -> dict`
-    - Convenience wrapper for sending a single control action
+  - Convenience wrapper for sending a single control action
+- `enable_requests_instrumentation() -> bool`
+- `disable_requests_instrumentation() -> None`
+- `enable_httpx_instrumentation(include_async: bool = True) -> bool`
+- `disable_httpx_instrumentation() -> None`
 - `capture_logs(loggers: str | list[str] | None = None) -> None`
 - `stop_capturing_logs(loggers: str | list[str] | None = None) -> None`
 - `start() -> None`

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from importlib import import_module
 from typing import Callable
 from typing import TYPE_CHECKING, Any, Dict, Mapping, MutableMapping, Optional
@@ -201,7 +202,28 @@ class SecployGate:
 		self(request=request_payload, auth=auth, metadata=metadata)
 
 		transport = session.request if session is not None else requests.request
-		return transport(method, url, **kwargs)
+		started_at = time.perf_counter()
+		try:
+			response = transport(method, url, **kwargs)
+		except Exception as exc:
+			self._track_outbound_dependency_call(
+				method=method,
+				url=url,
+				status_code=None,
+				duration_ms=(time.perf_counter() - started_at) * 1000,
+				metadata=metadata,
+				error=exc,
+			)
+			raise
+
+		self._track_outbound_dependency_call(
+			method=method,
+			url=url,
+			status_code=getattr(response, "status_code", None),
+			duration_ms=(time.perf_counter() - started_at) * 1000,
+			metadata=metadata,
+		)
+		return response
 
 	def session(
 		self,
@@ -507,6 +529,36 @@ class SecployGate:
 			)
 		except Exception as exc:
 			secploy_logger.warning(f"Secploy gate event tracking failed: {exc}")
+
+	def _track_outbound_dependency_call(
+		self,
+		*,
+		method: str,
+		url: str,
+		status_code: Optional[int],
+		duration_ms: float,
+		metadata: Optional[Dict[str, Any]] = None,
+		error: Optional[Exception] = None,
+	) -> None:
+		parsed = urlsplit((url or "").strip())
+		if not parsed.hostname:
+			return
+
+		context: Dict[str, Any] = {}
+		if metadata:
+			context["metadata"] = dict(metadata)
+
+		try:
+			self.client.track_external_service_request(
+				method=method,
+				url=url,
+				status_code=status_code,
+				duration_ms=duration_ms,
+				context=context,
+				error=error,
+			)
+		except Exception as exc:
+			secploy_logger.warning(f"Failed to track outbound dependency call for {method} {url}: {exc}")
 
 	def _build_gate_message(
 		self,

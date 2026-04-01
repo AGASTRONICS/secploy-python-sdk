@@ -1,5 +1,6 @@
 import threading
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, List, Union
 import queue
 import requests
@@ -133,6 +134,10 @@ class SecployClient:
         self.debug = getattr(config, 'debug', False)
         self.log_level = getattr(config, 'log_level', 'INFO')
         self.realtime = getattr(config, 'realtime', True)  # set False to disable WS
+        self.instrument_outbound_requests = bool(
+            getattr(config, 'instrument_outbound_requests', True)
+        )
+        self.instrument_httpx_async = bool(getattr(config, 'instrument_httpx_async', True))
 
         # Batch processing configuration
         self.batch_size = getattr(config, 'batch_size', 100)  # Max events per batch
@@ -174,6 +179,15 @@ class SecployClient:
             send_event=self.send_event,
             interval=metrics_interval,
         )
+
+        # Optional runtime monkey patching for httpx clients.
+        self._httpx_instrumented = False
+        self._httpx_original_client_request = None
+        self._httpx_original_async_client_request = None
+
+        # Optional runtime monkey patching for requests clients.
+        self._requests_instrumented = False
+        self._requests_original_session_request = None
 
         self.start()
     
@@ -241,6 +255,277 @@ class SecployClient:
             "context": context or {},
         }
         return self.send_event("http_request", payload)
+
+    def _classify_status_event_type(
+        self,
+        status_code: Optional[int] = None,
+        *,
+        errored: bool = False,
+    ) -> str:
+        if errored:
+            return "warning"
+        if status_code is None:
+            return "info"
+        if status_code >= 500:
+            return "critical"
+        if status_code >= 400:
+            return "warning"
+        return "info"
+
+    def track_external_service_request(
+        self,
+        method: str,
+        url: str,
+        status_code: Optional[int] = None,
+        message: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        duration_ms: Optional[float] = None,
+        error: Optional[Exception] = None,
+    ) -> bool:
+        """
+        Track an outbound dependency call made by the running service.
+        """
+        parsed = urlsplit((url or "").strip())
+        hostname = parsed.hostname or ""
+        if not hostname:
+            return False
+        if self._is_internal_secploy_url(url):
+            return False
+
+        host = parsed.netloc or hostname
+        path = parsed.path or "/"
+        merged_context: Dict[str, Any] = dict(context or {})
+        merged_context.update(
+            {
+                "telemetry_kind": "external_service_request",
+                "direction": "outbound",
+                "external_service_host": host,
+                "external_service_hostname": hostname,
+                "external_service_scheme": parsed.scheme or "https",
+                "external_service_path": path,
+                "external_service_url": url,
+            }
+        )
+        if parsed.port is not None:
+            merged_context["external_service_port"] = parsed.port
+        if parsed.query:
+            merged_context["external_service_query"] = parsed.query
+        if duration_ms is not None:
+            merged_context["duration_ms"] = round(duration_ms, 2)
+        if status_code is not None:
+            merged_context["external_service_status_code"] = status_code
+        if error is not None:
+            merged_context["error_type"] = type(error).__name__
+            merged_context["error_message"] = str(error)
+
+        payload: Dict[str, Any] = {
+            "name": hostname,
+            "method": method,
+            "message": message
+            or (
+                f"Outbound {method} {host}{path} failed"
+                if error is not None
+                else f"Outbound {method} {host}{path} completed"
+            ),
+            "context": merged_context,
+        }
+        if status_code is not None:
+            payload["status_code"] = status_code
+
+        event_type = self._classify_status_event_type(status_code, errored=error is not None)
+        return self.send_event(event_type, payload)
+
+    def _is_internal_secploy_url(self, url: str) -> bool:
+        """
+        Skip telemetry for Secploy control-plane traffic to avoid recursion/noise.
+        """
+        parsed = urlsplit((url or "").strip())
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            return False
+
+        secploy_hosts = set()
+        for candidate in (self.ingest_url, self.api_url):
+            candidate_host = (urlsplit((candidate or "").strip()).hostname or "").lower()
+            if candidate_host:
+                secploy_hosts.add(candidate_host)
+
+        if hostname in secploy_hosts:
+            return True
+        if hostname.endswith(".secploy.com") or hostname == "secploy.com":
+            return True
+        return False
+
+    def enable_requests_instrumentation(self) -> bool:
+        """
+        Monkey patch requests.Session.request to auto-capture outbound host telemetry
+        without requiring SecployGate wrappers.
+        """
+        if self._requests_instrumented:
+            return True
+
+        self._requests_original_session_request = requests.Session.request
+        original_session_request = self._requests_original_session_request
+        client_ref = self
+
+        def _tracked_session_request(session, method, url, *args, **kwargs):
+            should_track = bool(kwargs.pop("secploy_track_outbound", True))
+            if not should_track:
+                return original_session_request(session, method, url, *args, **kwargs)
+
+            started_at = time.perf_counter()
+            try:
+                response = original_session_request(session, method, url, *args, **kwargs)
+            except Exception as exc:
+                client_ref.track_external_service_request(
+                    method=str(method),
+                    url=str(url),
+                    status_code=None,
+                    duration_ms=(time.perf_counter() - started_at) * 1000,
+                    context={"transport": "requests"},
+                    error=exc,
+                )
+                raise
+
+            client_ref.track_external_service_request(
+                method=str(method),
+                url=str(url),
+                status_code=getattr(response, "status_code", None),
+                duration_ms=(time.perf_counter() - started_at) * 1000,
+                context={"transport": "requests"},
+            )
+            return response
+
+        requests.Session.request = _tracked_session_request
+        self._requests_instrumented = True
+        secploy_logger.info("Requests instrumentation enabled")
+        return True
+
+    def disable_requests_instrumentation(self) -> None:
+        """Restore original requests Session.request if it was patched."""
+        if not self._requests_instrumented:
+            return
+        if self._requests_original_session_request is not None:
+            requests.Session.request = self._requests_original_session_request
+
+        self._requests_instrumented = False
+        self._requests_original_session_request = None
+        secploy_logger.info("Requests instrumentation disabled")
+
+    def enable_httpx_instrumentation(self, include_async: bool = True) -> bool:
+        """
+        Monkey patch httpx Client/AsyncClient request methods so outbound host
+        telemetry is captured even when callers do not use security_session.
+
+        Returns:
+            bool: True if instrumentation is active, False when httpx is not installed.
+        """
+        if self._httpx_instrumented:
+            return True
+
+        try:
+            import httpx  # noqa: PLC0415
+        except Exception:
+            secploy_logger.warning(
+                "httpx is not installed; HTTPX instrumentation skipped. "
+                "Install it with: pip install httpx"
+            )
+            return False
+
+        self._httpx_original_client_request = httpx.Client.request
+        client_request = self._httpx_original_client_request
+        client_ref = self
+
+        def _tracked_client_request(httpx_client, method, url, *args, **kwargs):
+            should_track = bool(kwargs.pop("secploy_track_outbound", True))
+            if not should_track:
+                return client_request(httpx_client, method, url, *args, **kwargs)
+
+            started_at = time.perf_counter()
+            try:
+                response = client_request(httpx_client, method, url, *args, **kwargs)
+            except Exception as exc:
+                client_ref.track_external_service_request(
+                    method=str(method),
+                    url=str(url),
+                    status_code=None,
+                    duration_ms=(time.perf_counter() - started_at) * 1000,
+                    context={"transport": "httpx", "client_kind": "sync"},
+                    error=exc,
+                )
+                raise
+
+            client_ref.track_external_service_request(
+                method=str(method),
+                url=str(url),
+                status_code=getattr(response, "status_code", None),
+                duration_ms=(time.perf_counter() - started_at) * 1000,
+                context={"transport": "httpx", "client_kind": "sync"},
+            )
+            return response
+
+        httpx.Client.request = _tracked_client_request
+
+        if include_async and hasattr(httpx, "AsyncClient"):
+            self._httpx_original_async_client_request = httpx.AsyncClient.request
+            async_client_request = self._httpx_original_async_client_request
+
+            async def _tracked_async_client_request(httpx_client, method, url, *args, **kwargs):
+                should_track = bool(kwargs.pop("secploy_track_outbound", True))
+                if not should_track:
+                    return await async_client_request(httpx_client, method, url, *args, **kwargs)
+
+                started_at = time.perf_counter()
+                try:
+                    response = await async_client_request(httpx_client, method, url, *args, **kwargs)
+                except Exception as exc:
+                    client_ref.track_external_service_request(
+                        method=str(method),
+                        url=str(url),
+                        status_code=None,
+                        duration_ms=(time.perf_counter() - started_at) * 1000,
+                        context={"transport": "httpx", "client_kind": "async"},
+                        error=exc,
+                    )
+                    raise
+
+                client_ref.track_external_service_request(
+                    method=str(method),
+                    url=str(url),
+                    status_code=getattr(response, "status_code", None),
+                    duration_ms=(time.perf_counter() - started_at) * 1000,
+                    context={"transport": "httpx", "client_kind": "async"},
+                )
+                return response
+
+            httpx.AsyncClient.request = _tracked_async_client_request
+
+        self._httpx_instrumented = True
+        secploy_logger.info("HTTPX instrumentation enabled")
+        return True
+
+    def disable_httpx_instrumentation(self) -> None:
+        """Restore original httpx request methods if they were patched."""
+        if not self._httpx_instrumented:
+            return
+
+        try:
+            import httpx  # noqa: PLC0415
+        except Exception:
+            self._httpx_instrumented = False
+            self._httpx_original_client_request = None
+            self._httpx_original_async_client_request = None
+            return
+
+        if self._httpx_original_client_request is not None:
+            httpx.Client.request = self._httpx_original_client_request
+        if self._httpx_original_async_client_request is not None and hasattr(httpx, "AsyncClient"):
+            httpx.AsyncClient.request = self._httpx_original_async_client_request
+
+        self._httpx_instrumented = False
+        self._httpx_original_client_request = None
+        self._httpx_original_async_client_request = None
+        secploy_logger.info("HTTPX instrumentation disabled")
 
     def track_error(
         self,
@@ -539,6 +824,11 @@ class SecployClient:
         secploy_logger.info("Starting Secploy client...")
         self._event_processor.start()
         self.metrics.start()
+
+        if self.instrument_outbound_requests:
+            self.enable_requests_instrumentation()
+            self.enable_httpx_instrumentation(include_async=self.instrument_httpx_async)
+
         if self.realtime:
             ws_url = (
                 self.api_url
@@ -564,6 +854,10 @@ class SecployClient:
         # Stop all log capturing
         if hasattr(self, '_log_capturer'):
             self._log_capturer.stop_all()
+
+        # Restore patched HTTPX transport hooks if they were enabled.
+        self.disable_httpx_instrumentation()
+        self.disable_requests_instrumentation()
         
         # Stop event processing
         self._event_processor.stop()

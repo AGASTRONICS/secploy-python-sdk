@@ -33,6 +33,8 @@ DEFAULT_CONFIG = {
     "debug": False,
     "ingest_url": "https://ingest.secploy.com",
     "api_url": "https://api.secploy.com",
+    "instrument_outbound_requests": True,
+    "instrument_httpx_async": True,
 }
 
 def find_project_config() -> Optional[str]:

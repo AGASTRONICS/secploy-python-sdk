@@ -22,6 +22,8 @@ class SecployConfig(TypedDict, total=False):
     retry_attempts: int
     ignore_errors: bool
     source_root: Optional[str]
+    instrument_outbound_requests: bool
+    instrument_httpx_async: bool
 
 
 class SecurityControlActionRequest(TypedDict, total=False):

@@ -11,6 +11,7 @@ setup(
         "websocket-client>=1.9.0",
         "psutil>=5.4.0",
         "gputil>=1.4.0; extra == 'realtime'",
+        "httpx>=0.28.1",
     ],
     extras_require={
         "realtime": ["websocket-client>=1.9.0", "gputil>=1.4.0"],
