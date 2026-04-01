@@ -28,6 +28,7 @@ class EventProcessor:
         self.batch_size = batch_size
         self.flush_interval = flush_interval
         self.max_retry = max_retry
+        self._session = requests.Session()
         
         self._stop_event = threading.Event()
         self._thread = None
@@ -46,7 +47,7 @@ class EventProcessor:
         url = self.ingest_url
         for attempt in range(self.max_retry):
             try:
-                resp = requests.post(
+                resp = self._session.post(
                     url, 
                     json={"events": events}, 
                     headers=self._get_headers(),
@@ -116,5 +117,7 @@ class EventProcessor:
         # Flush any remaining events
         if self._event_batch.events:
             self._send_batch(self._event_batch.events)
+
+        self._session.close()
             
         self._thread = None

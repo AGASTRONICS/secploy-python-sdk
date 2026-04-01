@@ -29,6 +29,8 @@ class EventHandler:
         "critical",
         "http_request",
         "system_metrics",
+        "function_execution",
+        "function_registry",
     }
 
     def _normalize_event_type(self, value: Optional[str]) -> Optional[str]:

@@ -15,6 +15,32 @@ if TYPE_CHECKING:
 	from .client import SecployClient
 
 
+def _json_safe(value: Any, max_depth: int = 5) -> Any:
+	"""Best-effort conversion to JSON-serializable values for telemetry payloads."""
+	if max_depth <= 0:
+		return repr(value)
+
+	if value is None or isinstance(value, (str, int, float, bool)):
+		return value
+
+	if isinstance(value, bytes):
+		try:
+			return value.decode("utf-8", errors="replace")
+		except Exception:
+			return repr(value)
+
+	if isinstance(value, Mapping):
+		return {
+			str(k): _json_safe(v, max_depth=max_depth - 1)
+			for k, v in value.items()
+		}
+
+	if isinstance(value, (list, tuple, set)):
+		return [_json_safe(v, max_depth=max_depth - 1) for v in value]
+
+	return repr(value)
+
+
 class SecurityGateBlocked(Exception):
 	"""Raised when Secploy explicitly blocks a request."""
 
@@ -359,6 +385,7 @@ class SecployGate:
 				raise
 			finally:
 				duration = time.time() - start_time
+				duration_s = round(duration, 6)
 				# Try to get argument names and values
 				try:
 					sig = signature(fn)
@@ -367,27 +394,43 @@ class SecployGate:
 					arg_map = dict(bound.arguments)
 				except Exception:
 					arg_map = {}
-				payload = {
+
+				safe_args = _json_safe(args)
+				safe_kwargs = _json_safe(kwargs)
+				safe_arg_map = _json_safe(arg_map)
+				safe_exception = _json_safe(exc_info)
+				result_type = type(result).__name__ if result is not None else None
+				result_preview = _json_safe(result)
+
+				telemetry_context = {
+					"type": "function_execution",
 					"function": fn_name,
 					"module": fn.__module__,
 					"qualname": fn.__qualname__,
-					"args": args,
-					"kwargs": kwargs,
-					"arg_map": arg_map,
-					"result_type": type(result).__name__ if result is not None else None,
-					"exception": exc_info,
-					"duration": f"{duration:.6f}",
+					"args": safe_args,
+					"kwargs": safe_kwargs,
+					"arg_map": safe_arg_map,
+					"result_type": result_type,
+					"result_preview": result_preview,
+					"duration_seconds": duration_s,
+					"exception": safe_exception,
+					"started_at": start_time_iso,
+				}
+				payload = {
+					"type": "function_execution",
+					"name": fn_name,
+					"function": fn_name,
+					"module": fn.__module__,
+					"qualname": fn.__qualname__,
+					"args": safe_args,
+					"kwargs": safe_kwargs,
+					"arg_map": safe_arg_map,
+					"result_type": result_type,
+					"result_preview": result_preview,
+					"exception": safe_exception,
+					"duration": f"{duration_s:.6f}",
 					"timestamp": start_time_iso,
-					"context": {
-						"type": "function_execution",
-						"function": fn_name,
-						"module": fn.__module__,
-						"args": args,
-						"kwargs": kwargs,
-						"arg_map": arg_map,
-						"duration": f"{duration:.6f}",
-						"exception": exc_info,
-					},
+					"context": telemetry_context,
 					"message": f"Function {fn_name} executed in {duration:.4f}s" + (f" with exception: {exc_info['type']}" if exc_info else ""),
 				}
 				try:
