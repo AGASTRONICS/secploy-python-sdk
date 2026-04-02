@@ -35,6 +35,8 @@ DEFAULT_CONFIG = {
     "api_url": "https://api.secploy.com",
     "instrument_outbound_requests": True,
     "instrument_httpx_async": True,
+    "remote_scan_requests": True,
+    "scan_request_poll_interval": 30,
     "auto_dependency_health_report": True,
 }
 

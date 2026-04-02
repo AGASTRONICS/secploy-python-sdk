@@ -10,6 +10,7 @@ from secploy.lib.config import config_to_namespace
 
 from .lib import setup_logger, load_config, DEFAULT_CONFIG, secploy_logger
 from .schemas import (
+    DependencyScanRequest,
     DependencyHealthItem,
     DependencyHealthReport,
     DependencyHealthSummary,
@@ -142,6 +143,11 @@ class SecployClient:
             getattr(config, 'instrument_outbound_requests', True)
         )
         self.instrument_httpx_async = bool(getattr(config, 'instrument_httpx_async', True))
+        self.remote_scan_requests = bool(getattr(config, 'remote_scan_requests', True))
+        self.scan_request_poll_interval = max(
+            5,
+            int(getattr(config, 'scan_request_poll_interval', 30) or 30),
+        )
         self.auto_dependency_health_report = bool(
             getattr(config, 'auto_dependency_health_report', True)
         )
@@ -195,6 +201,10 @@ class SecployClient:
         # Optional runtime monkey patching for requests clients.
         self._requests_instrumented = False
         self._requests_original_session_request = None
+
+        # Background polling for platform-triggered dependency scans.
+        self._scan_request_thread: Optional[threading.Thread] = None
+        self._scan_request_stop = threading.Event()
 
         self.start()
     
@@ -826,6 +836,39 @@ class SecployClient:
 
         return self.submit_security_control_actions([action], timeout=timeout)
 
+    def fetch_dependency_scan_requests(self, timeout: int = 5) -> List[DependencyScanRequest]:
+        """
+        Poll for dependency scan requests issued from the Secploy platform.
+        """
+        url = f"{self.api_url}/projects/scans/requests/"
+        response = requests.get(url, headers=self._headers(), timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+        requests_list = payload.get("requests") if isinstance(payload, dict) else []
+        return requests_list if isinstance(requests_list, list) else []
+
+    def acknowledge_dependency_scan_request(
+        self,
+        request_id: str,
+        succeeded: bool,
+        detail: Optional[str] = None,
+        error: Optional[str] = None,
+        timeout: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Acknowledge a dependency scan request after the SDK handles it.
+        """
+        payload: Dict[str, Any] = {"succeeded": succeeded}
+        if detail:
+            payload["detail"] = detail
+        if error:
+            payload["error"] = error
+
+        url = f"{self.api_url}/projects/scans/requests/{request_id}/ack/"
+        response = requests.post(url, headers=self._headers(), json=payload, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
     def _list_installed_dependencies(self) -> List[Tuple[str, str]]:
         """
         Return installed distributions as (name, version) pairs sorted by name.
@@ -1105,6 +1148,61 @@ class SecployClient:
             name="secploy-dependency-health-report",
         ).start()
 
+    def _start_dependency_scan_request_polling(self) -> None:
+        if self._scan_request_thread is not None and self._scan_request_thread.is_alive():
+            return
+
+        self._scan_request_stop.clear()
+
+        def _worker() -> None:
+            while not self._scan_request_stop.wait(timeout=self.scan_request_poll_interval):
+                try:
+                    requests_to_process = self.fetch_dependency_scan_requests(timeout=5)
+                except Exception as exc:
+                    secploy_logger.warning(f"Dependency scan request poll failed: {exc}")
+                    continue
+
+                for request in requests_to_process:
+                    request_id = request.get("request_id")
+                    if not request_id:
+                        continue
+
+                    try:
+                        emitted = self.emit_dependency_health_report()
+                        if not emitted:
+                            raise RuntimeError("SDK failed to emit dependency health report")
+
+                        self.acknowledge_dependency_scan_request(
+                            request_id=request_id,
+                            succeeded=True,
+                            detail="Dependency health report emitted by SDK.",
+                            timeout=5,
+                        )
+                    except Exception as exc:
+                        secploy_logger.warning(f"Dependency scan request handling failed: {exc}")
+                        try:
+                            self.acknowledge_dependency_scan_request(
+                                request_id=request_id,
+                                succeeded=False,
+                                error=str(exc),
+                                timeout=5,
+                            )
+                        except Exception as ack_exc:
+                            secploy_logger.warning(f"Dependency scan request acknowledgement failed: {ack_exc}")
+
+        self._scan_request_thread = threading.Thread(
+            target=_worker,
+            daemon=True,
+            name="secploy-scan-request-poll",
+        )
+        self._scan_request_thread.start()
+
+    def _stop_dependency_scan_request_polling(self) -> None:
+        self._scan_request_stop.set()
+        if self._scan_request_thread is not None:
+            self._scan_request_thread.join(timeout=3)
+            self._scan_request_thread = None
+
     def start(self):
         """Start the client's event processing and real-time config delivery."""
         secploy_logger.info("Starting Secploy client...")
@@ -1117,6 +1215,9 @@ class SecployClient:
 
         if self.auto_dependency_health_report:
             self._emit_dependency_health_report_async()
+
+        if self.remote_scan_requests:
+            self._start_dependency_scan_request_polling()
 
         if self.realtime:
             ws_url = (
@@ -1135,6 +1236,9 @@ class SecployClient:
 
         # Stop real-time config delivery (WebSocket + polling fallback)
         self.configs.stop_realtime()
+
+        # Stop dependency scan request polling.
+        self._stop_dependency_scan_request_polling()
 
         # Stop config auto-refresh if running
         if self.configs.is_refreshing:

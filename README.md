@@ -604,6 +604,11 @@ When `SecployClient()` starts, the SDK builds a dependency health report,
 then sends it through ingest as a `dependency_health_report` event so it can
 be shown in frontend dashboards without extra SDK code.
 
+The SDK also polls for dependency scan requests created from the Secploy
+platform. When an operator clicks scan in the dashboard, an integrated backend
+can pick up that request automatically and emit a fresh report without adding
+custom endpoint code.
+
 This keeps usage simple: initialize once and Secploy handles the rest.
 
 ```python
@@ -617,6 +622,14 @@ If needed, you can disable automatic dependency reporting:
 
 ```yaml
 auto_dependency_health_report: false
+```
+
+If needed, you can also disable remote scan request polling or adjust its
+interval:
+
+```yaml
+remote_scan_requests: true
+scan_request_poll_interval: 30
 ```
 
 Frontend and backend teams can use the canonical event schema here:

@@ -24,11 +24,23 @@ class SecployConfig(TypedDict, total=False):
     source_root: Optional[str]
     instrument_outbound_requests: bool
     instrument_httpx_async: bool
+    remote_scan_requests: bool
+    scan_request_poll_interval: int
     auto_dependency_report: bool
     dependency_report_limit: int
     dependency_report_incidents_limit: int
     dependency_report_include_current_issues: bool
     dependency_report_include_latest_issues: bool
+
+
+class DependencyScanRequest(TypedDict, total=False):
+    request_id: str
+    status: str
+    created_at: str
+    expires_at: Optional[str]
+    acknowledged_at: Optional[str]
+    detail: Optional[str]
+    error: Optional[str]
 
 
 class SecurityControlActionRequest(TypedDict, total=False):
