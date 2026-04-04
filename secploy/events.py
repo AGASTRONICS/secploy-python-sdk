@@ -34,11 +34,37 @@ class EventHandler:
         "dependency_health_report",
     }
 
+    # Top-level namespaces for security/domain signals (e.g. fraud.rule.matched)
+    _ALLOWED_NAMESPACED_PREFIXES = (
+        "auth.",
+        "account.",
+        "payment.",
+        "fraud.",
+        "compliance.",
+        "access.",
+        "data.",
+        "api.",
+        "secret.",
+        "security.",
+        "incident.",
+        "dependency_scan.",
+    )
+
     def _normalize_event_type(self, value: Optional[str]) -> Optional[str]:
         if not value:
             return None
         normalized = str(value).strip().lower()
         return normalized if normalized in self._ALLOWED_EVENT_TYPES else None
+    def _normalize_event_type(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        normalized = str(value).strip().lower()
+        if normalized in self._ALLOWED_EVENT_TYPES:
+            return normalized
+        # Allow well-known namespaced security/domain signal types
+        if any(normalized.startswith(prefix) for prefix in self._ALLOWED_NAMESPACED_PREFIXES):
+            return normalized
+        return None
 
     def _infer_event_type_from_status(self, status_code: Any) -> Optional[str]:
         try:

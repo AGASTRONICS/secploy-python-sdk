@@ -352,6 +352,30 @@ class SecployClient:
         event_type = self._classify_status_event_type(status_code, errored=error is not None)
         return self.send_event(event_type, payload)
 
+    def track_security_signal(
+        self,
+        event_type: str,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        risk_score: Optional[float] = None,
+    ) -> bool:
+        """
+        Emit a named security/domain signal to the ingest pipeline.
+
+        ``event_type`` must use a recognised namespace prefix:
+        ``auth.``, ``fraud.``, ``payment.``, ``account.``, ``compliance.``,
+        ``access.``, ``data.``, ``api.``, ``secret.``, ``security.``,
+        ``incident.``, or ``dependency_scan.``
+        """
+        ctx: Dict[str, Any] = dict(context or {})
+        if risk_score is not None:
+            ctx["risk_score"] = risk_score
+        payload: Dict[str, Any] = {"message": message, "context": ctx}
+        if metadata:
+            payload["metadata"] = metadata
+        return self.send_event(event_type, payload)
+
     def _is_internal_secploy_url(self, url: str) -> bool:
         """
         Skip telemetry for Secploy control-plane traffic to avoid recursion/noise.

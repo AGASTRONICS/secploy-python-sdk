@@ -5,7 +5,17 @@ Secploy SDK - Event ingestion, log capture, realtime config sync, and security g
 
 from .client import SecployClient
 from .gates import GateDecision, GateRequest, SecurityGateException
-from .handlers import SecployGate, SecurityGateBlocked, SecploySessionAdapter
+from .handlers import (
+    SecployGate,
+    SecurityGateBlocked,
+    SecploySessionAdapter,
+    MFARequiredException,
+    SessionRevokedException,
+    SessionRestrictedException,
+    IPBlockedException,
+    RateLimitedException,
+    APIKeyBlockedException,
+)
 from .schemas import SecployConfig
 from .schemas import LogLevel
 from .system_metrics import SystemMetricsCollector
@@ -28,6 +38,13 @@ __all__ = [
     "LogLevel",
     "SystemMetricsCollector",
     "SecployRegister",
+    # Control-specific exceptions
+    "MFARequiredException",
+    "SessionRevokedException",
+    "SessionRestrictedException",
+    "IPBlockedException",
+    "RateLimitedException",
+    "APIKeyBlockedException",
 ]
 
 

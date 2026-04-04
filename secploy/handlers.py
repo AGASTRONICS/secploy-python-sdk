@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import time
+from functools import wraps
 from importlib import import_module
 from typing import Callable
 from typing import TYPE_CHECKING, Any, Dict, Mapping, MutableMapping, Optional
@@ -63,6 +64,55 @@ class SecurityGateBlocked(Exception):
 		if self.action_type or self.target:
 			parts.append(f"control={self.action_type or 'unknown'}:{self.target or 'unknown'}")
 		super().__init__(" | ".join(parts))
+
+
+class MFARequiredException(SecurityGateBlocked):
+	"""Raised when Secploy requires MFA verification before the request is allowed.
+
+	The caller should redirect the user to an MFA challenge.  ``http_status_code``
+	is 401 so that frameworks can map it to a ``401 Unauthorized`` response.
+	"""
+
+	http_status_code: int = 401
+
+
+class SessionRevokedException(SecurityGateBlocked):
+	"""Raised when Secploy has revoked the caller's session (``revoke_session``)."""
+
+	http_status_code: int = 401
+
+
+class SessionRestrictedException(SecurityGateBlocked):
+	"""Raised when Secploy has restricted (but not fully revoked) the session (``restrict_session``)."""
+
+	http_status_code: int = 403
+
+
+class IPBlockedException(SecurityGateBlocked):
+	"""Raised when Secploy blocks the request based on the source IP address (``block_ip``)."""
+
+	http_status_code: int = 403
+
+
+class RateLimitedException(SecurityGateBlocked):
+	"""Raised when Secploy applies a rate-limit control (``rate_limit``).
+
+	``retry_after`` is populated from the control's ``retry_after`` field when
+	present (seconds until the limit resets).
+	"""
+
+	http_status_code: int = 429
+
+	def __init__(self, decision: SecurityGateDecision) -> None:
+		super().__init__(decision)
+		first_control = self.controls[0] if self.controls else {}
+		self.retry_after: Optional[int] = first_control.get("retry_after")
+
+
+class APIKeyBlockedException(SecurityGateBlocked):
+	"""Raised when Secploy blocks the request because the API key is revoked (``block_api_key``)."""
+
+	http_status_code: int = 401
 
 
 class SecploySessionAdapter:
@@ -160,6 +210,7 @@ class SecployGate:
 		self.fail_open = fail_open
 		self.raise_on_block = raise_on_block
 		self.track_decisions = track_decisions
+		self._protected_bindings: Dict[str, Dict[str, str]] = {}
 
 	def __call__(
 		self,
@@ -478,6 +529,326 @@ class SecployGate:
 			)
 		except Exception as exc:
 			secploy_logger.warning(f"Failed to sync function registry: {exc}")
+
+	# ------------------------------------------------------------------ #
+	#  Endpoint / function protection decorator                           #
+	# ------------------------------------------------------------------ #
+
+	_CONTROL_TO_EXCEPTION: Dict[str, type] = {
+		"force_mfa":        MFARequiredException,
+		"revoke_session":   SessionRevokedException,
+		"restrict_session": SessionRestrictedException,
+		"block_ip":         IPBlockedException,
+		"rate_limit":       RateLimitedException,
+		"block_api_key":    APIKeyBlockedException,
+	}
+
+	def protect(
+		self,
+		endpoint: Optional[str] = None,
+		method: Optional[str] = None,
+		auth: Optional[Dict[str, Any]] = None,
+		auth_extractor: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
+		on_block: Optional[Callable[..., Any]] = None,
+		on_mfa_required: Optional[Callable[..., Any]] = None,
+		on_session_revoked: Optional[Callable[..., Any]] = None,
+		on_ip_blocked: Optional[Callable[..., Any]] = None,
+		on_rate_limited: Optional[Callable[..., Any]] = None,
+	) -> Callable:
+		"""Decorator that evaluates the Secploy security decision for the decorated
+		endpoint or callable and raises the most-specific exception for the active
+		control returned by the backend rule engine.
+
+		Supported ``action_type`` → exception mapping:
+
+		* ``force_mfa``        → :class:`MFARequiredException`   (HTTP 401)
+		* ``revoke_session``   → :class:`SessionRevokedException` (HTTP 401)
+		* ``restrict_session`` → :class:`SessionRestrictedException` (HTTP 403)
+		* ``block_ip``         → :class:`IPBlockedException`      (HTTP 403)
+		* ``rate_limit``       → :class:`RateLimitedException`    (HTTP 429)
+		* ``block_api_key``    → :class:`APIKeyBlockedException`  (HTTP 401)
+		* *(any other block)*  → :class:`SecurityGateBlocked`     (HTTP 403)
+
+		Control-specific handlers (``on_mfa_required``, ``on_session_revoked``,
+		``on_ip_blocked``, ``on_rate_limited``, ``on_block``) are called with
+		``(request_obj, exception)`` when provided.  If the handler returns a
+		non-``None`` value that value becomes the function's return value
+		(useful for returning framework response objects instead of raising).
+
+		The decorator transparently supports both regular and ``async`` callables.
+
+		Args:
+			endpoint:           Override the endpoint path for the gate lookup.
+			method:             Override the HTTP method (defaults to the
+			                    ``method`` attribute of the first request-like
+			                    argument, or ``"GET"``).
+			auth:               Static auth context merged into the gate check.
+			auth_extractor:     Callable invoked with the same ``*args/**kwargs``
+			                    as the decorated function; must return an auth
+			                    dict or ``None``.
+			on_block:           Handler for generic blocks and ``block_api_key``.
+			on_mfa_required:    Handler for ``force_mfa`` controls.
+			on_session_revoked: Handler for ``revoke_session`` /
+			                    ``restrict_session`` controls.
+			on_ip_blocked:      Handler for ``block_ip`` controls.
+			on_rate_limited:    Handler for ``rate_limit`` controls.
+
+		Example::
+
+			gate = client.security_gate()
+
+			# Basic: auto-extracts method + endpoint from the request object
+			@gate.protect()
+			async def transfer_funds(request: Request):
+				...
+
+			# Fine-grained: explicit config + per-control handlers
+			@gate.protect(
+				endpoint="/api/admin/reset",
+				method="POST",
+				on_mfa_required=lambda req, exc: JSONResponse(
+					{"mfa_required": True, "reason": exc.reason}, status_code=401
+				),
+				on_ip_blocked=lambda req, exc: JSONResponse(
+					{"detail": "Access denied"}, status_code=403
+				),
+			)
+			async def admin_reset(request: Request):
+				...
+		"""
+		def decorator(fn: Callable) -> Callable:
+			# Register the decorated callable once immediately. If endpoint/method
+			# are not explicitly provided, runtime resolution will register the
+			# concrete binding on first call.
+			self._register_protected_binding(fn, method=method, endpoint=endpoint)
+
+			_handlers: Dict[str, Optional[Callable[..., Any]]] = {
+				"force_mfa":        on_mfa_required,
+				"revoke_session":   on_session_revoked,
+				"restrict_session": on_session_revoked,
+				"block_ip":         on_ip_blocked,
+				"rate_limit":       on_rate_limited,
+				"block_api_key":    on_block,
+				"__default__":      on_block,
+			}
+
+			@wraps(fn)
+			def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+				req_dict, resolved_auth = self._resolve_protect_context(
+					fn, args, kwargs, endpoint, method, auth, auth_extractor
+				)
+				self._register_protected_binding(
+					fn,
+					method=req_dict.get("method"),
+					endpoint=req_dict.get("endpoint"),
+				)
+				decision = self.inspect(request=req_dict, auth=resolved_auth)
+				if decision.get("blocked"):
+					result = self._dispatch_control_exception(decision, args, _handlers)
+					if result is not None:
+						return result
+				return fn(*args, **kwargs)
+
+			@wraps(fn)
+			async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+				req_dict, resolved_auth = self._resolve_protect_context(
+					fn, args, kwargs, endpoint, method, auth, auth_extractor
+				)
+				self._register_protected_binding(
+					fn,
+					method=req_dict.get("method"),
+					endpoint=req_dict.get("endpoint"),
+				)
+				decision = self.inspect(request=req_dict, auth=resolved_auth)
+				if decision.get("blocked"):
+					result = self._dispatch_control_exception(decision, args, _handlers)
+					if result is not None:
+						if inspect.isawaitable(result):
+							return await result
+						return result
+				ret = fn(*args, **kwargs)
+				if inspect.isawaitable(ret):
+					return await ret
+				return ret
+
+			if inspect.iscoroutinefunction(fn):
+				return async_wrapper
+			return sync_wrapper
+
+		return decorator
+
+	def _register_protected_binding(
+		self,
+		fn: Callable,
+		method: Optional[str],
+		endpoint: Optional[str],
+	) -> None:
+		"""Register a protected function/endpoint mapping once and sync it."""
+		fn_name = fn.__qualname__
+		self._registered_functions.setdefault(fn_name, fn)
+
+		resolved_method = str(method or "GET").strip().upper() or "GET"
+		resolved_endpoint = str(endpoint or "").strip()
+		if not resolved_endpoint:
+			resolved_endpoint = "/" + fn_name.replace(".", "/").replace(" ", "_")
+		if not resolved_endpoint.startswith("/"):
+			resolved_endpoint = f"/{resolved_endpoint}"
+
+		binding_key = f"{fn_name}:{resolved_method}:{resolved_endpoint}"
+		if binding_key in self._protected_bindings:
+			return
+
+		self._protected_bindings[binding_key] = {
+			"function": fn_name,
+			"module": fn.__module__,
+			"method": resolved_method,
+			"endpoint": resolved_endpoint,
+		}
+		self._sync_protected_registry()
+
+	def _sync_protected_registry(self) -> None:
+		"""Best-effort sync of protect() registry to backend for visibility."""
+		try:
+			self.client.send_event(
+				event_type="protected_function_registry",
+				payload={
+					"functions": list(self._registered_functions.keys()),
+					"bindings": list(self._protected_bindings.values()),
+				},
+			)
+		except Exception as exc:
+			secploy_logger.warning(f"Failed to sync protected function registry: {exc}")
+
+	def _resolve_protect_context(
+		self,
+		fn: Callable,
+		args: tuple,
+		kwargs: Dict[str, Any],
+		endpoint: Optional[str],
+		method: Optional[str],
+		explicit_auth: Optional[Dict[str, Any]],
+		auth_extractor: Optional[Callable[..., Optional[Dict[str, Any]]]],
+	) -> tuple:
+		"""Build the ``(request_dict, auth_dict)`` pair consumed by ``inspect()``.
+
+		Endpoint, method, headers, and cookies are auto-derived from the first
+		request-like argument when not provided explicitly.
+		"""
+		request_obj = self._find_request_arg(fn, args, kwargs)
+
+		resolved_endpoint = endpoint
+		if not resolved_endpoint and request_obj is not None:
+			resolved_endpoint = self._extract_request_url(request_obj) or None
+		if not resolved_endpoint:
+			resolved_endpoint = "/" + fn.__qualname__.replace(".", "/").replace(" ", "_")
+
+		resolved_method = method
+		if not resolved_method and request_obj is not None:
+			resolved_method = str(getattr(request_obj, "method", None) or "").upper() or None
+		resolved_method = resolved_method or "GET"
+
+		req_dict: Dict[str, Any] = {
+			"method": resolved_method,
+			"endpoint": resolved_endpoint,
+		}
+		if request_obj is not None:
+			req_dict["headers"] = self._coerce_headers(request_obj)
+			req_dict["cookies"] = self._coerce_cookies(request_obj)
+
+		# --- auth resolution ---
+		resolved_auth: Optional[Dict[str, Any]] = None
+		if auth_extractor is not None:
+			try:
+				resolved_auth = auth_extractor(*args, **kwargs)
+			except Exception:
+				pass
+		if resolved_auth is None and explicit_auth:
+			resolved_auth = dict(explicit_auth)
+		if resolved_auth is None:
+			auto_auth: Dict[str, Any] = {}
+			for key in ("user_id", "session_id", "identity_key", "auth_provider",
+			            "ip_address", "remote_addr"):
+				val = kwargs.get(key)
+				if val is not None:
+					auto_auth[key] = str(val)
+			if auto_auth:
+				resolved_auth = auto_auth
+
+		return req_dict, resolved_auth
+
+	def _dispatch_control_exception(
+		self,
+		decision: SecurityGateDecision,
+		args: tuple,
+		handlers: Dict[str, Optional[Callable[..., Any]]],
+	) -> Any:
+		"""Raise the most-specific control exception or invoke a registered handler.
+
+		Returns a non-``None`` value if a handler handled the block without
+		raising; otherwise raises the exception so the call site propagates it.
+		"""
+		controls = decision.get("controls") or []
+		action_types = [
+			str(c.get("action_type") or "").lower()
+			for c in controls if isinstance(c, dict)
+		]
+
+		priority = [
+			"force_mfa",
+			"revoke_session",
+			"restrict_session",
+			"block_ip",
+			"rate_limit",
+			"block_api_key",
+		]
+		matched = next((a for a in priority if a in action_types), "__default__")
+
+		exc_class = self._CONTROL_TO_EXCEPTION.get(matched, SecurityGateBlocked)
+		exc = exc_class(decision)  # type: ignore[call-arg]
+
+		handler = handlers.get(matched) or handlers.get("__default__")
+		if handler is not None:
+			request_obj = next((a for a in args if self._looks_like_request(a)), None)
+			result = self._invoke_blocked_handler(handler, request_obj, exc)
+			if result is not None:
+				return result
+
+		raise exc
+
+	def _find_request_arg(
+		self,
+		fn: Callable,
+		args: tuple,
+		kwargs: Dict[str, Any],
+	) -> Optional[Any]:
+		"""Return the first request-like object found in the function's arguments."""
+		for key in ("request", "req"):
+			val = kwargs.get(key)
+			if val is not None and self._looks_like_request(val):
+				return val
+
+		try:
+			sig = inspect.signature(fn)
+			params = list(sig.parameters.values())
+			for i, param in enumerate(params):
+				if i >= len(args):
+					break
+				if param.name in ("request", "req") or self._looks_like_request(args[i]):
+					return args[i]
+		except (ValueError, TypeError):
+			for arg in args:
+				if self._looks_like_request(arg):
+					return arg
+
+		return None
+
+	def _looks_like_request(self, obj: Any) -> bool:
+		"""Heuristic: does *obj* resemble an HTTP request object?"""
+		if obj is None or isinstance(obj, (str, int, float, bool, bytes, dict, list)):
+			return False
+		return (hasattr(obj, "method") and hasattr(obj, "url")) or (
+			hasattr(obj, "method") and hasattr(obj, "path")
+		)
 
 	def _track_decision(self, decision: SecurityGateDecision) -> None:
 		signal_context = self._extract_security_signals(decision)
