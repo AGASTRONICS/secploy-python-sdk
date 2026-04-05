@@ -767,6 +767,63 @@ class SecployClient:
         decision = self.get_endpoint_decision(method=method, endpoint=endpoint, timeout=5)
         return bool(decision.get("blocked", False))
 
+    @staticmethod
+    def register_identity(
+        id: Any,
+        name: Optional[str] = None,
+        username: Optional[str] = None,
+        avater: Optional[str] = None,
+        avatar: Optional[str] = None,
+        email: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        is_authenticated: Optional[bool] = None,
+        auth_provider: Optional[str] = None,
+        session_id: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        remote_addr: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a normalized identity context dict for gate auth parameters.
+
+        This is a pythonic helper for apps that prefer explicit identity
+        registration without depending on decorator-injected ``protector``.
+        The returned dictionary can be passed to:
+        - ``SecployGate.inspect(..., auth=...)``
+        - ``SecployGate.request(..., auth=...)``
+        - ``client.security_session(..., auth=...)`` / ``secploy_auth``.
+        """
+        identity_key = str(id).strip() if id is not None else ""
+        if not identity_key:
+            identity_key = "anonymous"
+
+        auth_context: Dict[str, Any] = {
+            "identity_key": identity_key,
+        }
+
+        if name:
+            auth_context["name"] = str(name)
+        if username:
+            auth_context["username"] = str(username)
+        if avatar:
+            auth_context["avatar"] = str(avatar)
+        elif avater:
+            auth_context["avatar"] = str(avater)
+        if email:
+            auth_context["email"] = str(email)
+        if metadata is not None:
+            auth_context["metadata"] = dict(metadata)
+        if is_authenticated is not None:
+            auth_context["is_authenticated"] = bool(is_authenticated)
+        if auth_provider:
+            auth_context["auth_provider"] = str(auth_provider)
+        if session_id:
+            auth_context["session_id"] = str(session_id)
+        if ip_address:
+            auth_context["ip_address"] = str(ip_address)
+        if remote_addr:
+            auth_context["remote_addr"] = str(remote_addr)
+
+        return auth_context
+
     def security_gate(
         self,
         timeout: int = 5,

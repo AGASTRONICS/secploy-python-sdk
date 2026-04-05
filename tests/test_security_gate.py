@@ -38,6 +38,31 @@ def build_client(
 
 
 class SecployGateRuntimeTests(unittest.TestCase):
+    def test_client_register_identity_returns_normalized_auth_context(self) -> None:
+        auth = SecployClient.register_identity(
+            id="user_123",
+            name="Test User",
+            username="tester",
+            email="test@example.com",
+            auth_provider="bearer",
+            session_id="sess_1",
+            remote_addr="127.0.0.1",
+            is_authenticated=True,
+        )
+
+        self.assertEqual(auth["identity_key"], "user_123")
+        self.assertEqual(auth["name"], "Test User")
+        self.assertEqual(auth["username"], "tester")
+        self.assertEqual(auth["email"], "test@example.com")
+        self.assertEqual(auth["auth_provider"], "bearer")
+        self.assertEqual(auth["session_id"], "sess_1")
+        self.assertEqual(auth["remote_addr"], "127.0.0.1")
+        self.assertTrue(auth["is_authenticated"])
+
+    def test_client_register_identity_uses_anonymous_when_id_missing(self) -> None:
+        auth = SecployClient.register_identity(id=None)
+        self.assertEqual(auth["identity_key"], "anonymous")
+
     def test_gate_returns_original_request_when_allowed(self) -> None:
         gate = SecployGate(client=build_client(blocked=False))
         request = {
@@ -260,6 +285,39 @@ class SecployGateRuntimeTests(unittest.TestCase):
             return "ok"
 
         self.assertEqual(public_endpoint(), "ok")
+
+    def test_protect_injects_protector_when_kwarg_is_none(self) -> None:
+        gate = SecployGate(client=build_client(blocked=True, with_controls=True))
+        checkpoint = []
+
+        @gate.protect(endpoint="/me", method="GET")
+        def me(protector=None):
+            checkpoint.append("entered")
+            protector.register_identity(id="user_123")
+            checkpoint.append("after")
+            return "ok"
+
+        with self.assertRaises(SecurityGateBlocked):
+            me(protector=None)
+
+        self.assertEqual(checkpoint, ["entered"])
+
+    def test_protect_injects_protector_when_kwarg_is_signature_default(self) -> None:
+        gate = SecployGate(client=build_client(blocked=True, with_controls=True))
+        checkpoint = []
+        sentinel = object()
+
+        @gate.protect(endpoint="/me", method="GET")
+        def me(protector=sentinel):
+            checkpoint.append("entered")
+            protector.register_identity(id="user_123")
+            checkpoint.append("after")
+            return "ok"
+
+        with self.assertRaises(SecurityGateBlocked):
+            me(protector=sentinel)
+
+        self.assertEqual(checkpoint, ["entered"])
 
     def test_django_middleware_uses_custom_blocked_handler(self) -> None:
         gate = SecployGate(client=build_client(blocked=True))

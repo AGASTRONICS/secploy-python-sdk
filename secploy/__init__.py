@@ -21,7 +21,7 @@ from .schemas import LogLevel
 from .system_metrics import SystemMetricsCollector
 from .register import SecployRegister
 
-__version__ = "1.3.5"
+__version__ = "1.3.6"
 __author__ = "Abdulsamad .O. Abdulganiy"
 __email__ = "support@secploy.com"
 __description__ = "Event ingestion, log capture, realtime config sync, and security gating SDK for Python applications"
@@ -45,7 +45,45 @@ __all__ = [
     "IPBlockedException",
     "RateLimitedException",
     "APIKeyBlockedException",
+    "register_identity",
 ]
+
+
+def register_identity(
+    id,
+    name=None,
+    username=None,
+    avater=None,
+    avatar=None,
+    email=None,
+    metadata=None,
+    is_authenticated=None,
+    auth_provider=None,
+    session_id=None,
+    ip_address=None,
+    remote_addr=None,
+):
+    """Build normalized identity context for gate auth payloads.
+
+    Convenience wrapper around ``SecployClient.register_identity(...)`` so
+    applications can use a function-style import:
+
+        from secploy import register_identity
+    """
+    return SecployClient.register_identity(
+        id=id,
+        name=name,
+        username=username,
+        avater=avater,
+        avatar=avatar,
+        email=email,
+        metadata=metadata,
+        is_authenticated=is_authenticated,
+        auth_provider=auth_provider,
+        session_id=session_id,
+        ip_address=ip_address,
+        remote_addr=remote_addr,
+    )
 
 
 # ---------------------------------------------------------------------------

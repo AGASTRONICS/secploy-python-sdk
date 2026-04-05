@@ -903,8 +903,6 @@ class SecployGate:
 
 	def _function_accepts_protector(self, fn: Callable, kwargs: Dict[str, Any]) -> bool:
 		"""Return True when ``protect`` should inject a ``protector`` argument."""
-		if "protector" in kwargs:
-			return False
 		try:
 			sig = inspect.signature(fn)
 		except (TypeError, ValueError):
@@ -912,10 +910,26 @@ class SecployGate:
 		param = sig.parameters.get("protector")
 		if param is None:
 			return False
-		return param.kind in (
+		if param.kind not in (
 			inspect.Parameter.POSITIONAL_OR_KEYWORD,
 			inspect.Parameter.KEYWORD_ONLY,
-		)
+		):
+			return False
+
+		if "protector" not in kwargs:
+			return True
+
+		# Some frameworks pass defaulted kwargs explicitly. Allow injection when
+		# the provided value is effectively "not set" by user code.
+		provided = kwargs.get("protector")
+		if provided is None:
+			return True
+
+		default = param.default
+		if default is not inspect.Parameter.empty and provided is default:
+			return True
+
+		return False
 
 	def _filter_controls_by_auth_scope(
 		self,
