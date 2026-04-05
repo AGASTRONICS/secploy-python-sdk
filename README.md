@@ -103,7 +103,6 @@ var_a = client.env.var_a
 client.stop()
 ```
 
-
 ## Function Monitoring & Telemetry
 
 Secploy lets you monitor and control specific Python functions, emitting rich telemetry for every invocation. This enables security, audit, and analytics use cases.
@@ -127,11 +126,11 @@ monitored = gate.register_function(lambda a, b: a * b)
 monitored(3, 4)
 ```
 
-### What Happens
 - Before each function call, SecployGate checks security policy (can block or allow).
 - After execution, a `function_execution` event is emitted with full telemetry.
 
 ### Telemetry Fields
+
 Each function execution event includes:
 - `function`: Qualified function name
 - `module`: Module name
@@ -145,6 +144,7 @@ Each function execution event includes:
 - `message`: Human-readable summary
 
 Example event payload:
+
 ```json
 {
     "function": "my_module.protected_function",
@@ -202,6 +202,30 @@ except SecurityGateBlocked as exc:
 ```
 
 `SecployGate` accepts dictionaries plus common request objects from `requests`, Flask, Django, and FastAPI / Starlette.
+
+`SecployGate` now always resolves an identity and source IP for each protected decision:
+
+- `identity_key` defaults to `"anonymous"` when no user identity is available.
+- `ip_address` / `remote_addr` are derived from request client metadata or forwarded-IP headers.
+
+For endpoint decorators, you can register authenticated identity details directly from your handler:
+
+```python
+@gate.protect(endpoint="/me", method="GET")
+def me(protector):
+    user = get_current_user()
+    protector.register_identity(
+        id=user.id,
+        name=user.full_name or user.username,
+        avater=None,  # alias supported for backward compatibility
+        email=user.email,
+        metadata={"role": user.role},
+        is_authenticated=True,
+    )
+    return {"id": user.id}
+```
+
+Call `register_identity(...)` as early as possible in the handler so identity-scoped rules can be enforced before business logic runs.
 
 You can also build it from an existing client:
 

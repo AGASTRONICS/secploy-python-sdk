@@ -17,7 +17,7 @@ def build_client(
     client.send_event = Mock(return_value=True)
     if send_event_side_effect is not None:
         client.send_event.side_effect = send_event_side_effect
-    client.get_endpoint_decision = lambda method, endpoint, timeout=5: {
+    client.get_endpoint_decision = lambda method, endpoint, auth=None, timeout=5: {
         "allowed": not blocked,
         "blocked": blocked,
         "method": method,
@@ -99,6 +99,39 @@ class SecployGateRuntimeTests(unittest.TestCase):
         self.assertEqual(ctx["session_id"], "sess_99")
         self.assertEqual(ctx["auth_provider"], "bearer")
         self.assertEqual(ctx["remote_addr"], "10.0.0.1")
+
+    def test_gate_defaults_to_anonymous_identity_with_ip_fallback(self) -> None:
+        client = build_client(blocked=False)
+        gate = SecployGate(client=client)
+
+        decision = gate.inspect(
+            request={
+                "method": "GET",
+                "url": "https://api.example.com/public",
+                "headers": {"X-Forwarded-For": "203.0.113.10"},
+            }
+        )
+
+        auth = decision["auth"]
+        self.assertEqual(auth["identity_key"], "anonymous")
+        self.assertEqual(auth["ip_address"], "203.0.113.10")
+        self.assertEqual(auth["remote_addr"], "203.0.113.10")
+
+    def test_identity_control_only_blocks_matching_identity(self) -> None:
+        gate = SecployGate(client=build_client(blocked=True, with_controls=True))
+
+        allowed = gate.inspect(
+            request={"method": "GET", "url": "https://api.example.com/orders"},
+            auth={"identity_key": "user_999"},
+        )
+        self.assertFalse(allowed["blocked"])
+        self.assertEqual(allowed["reason"], "control_not_applicable")
+
+        with self.assertRaises(SecurityGateBlocked):
+            gate(
+                request={"method": "GET", "url": "https://api.example.com/orders"},
+                auth={"identity_key": "user_123"},
+            )
 
     def test_blocked_event_sets_403_status(self) -> None:
         client = build_client(blocked=True)
@@ -188,12 +221,45 @@ class SecployGateRuntimeTests(unittest.TestCase):
         gate = SecployGate(client=build_client(blocked=True, with_controls=True))
 
         with self.assertRaises(SecurityGateBlocked) as ctx:
-            gate.request("DELETE", "https://api.example.com/orders/1")
+            gate.request(
+                "DELETE",
+                "https://api.example.com/orders/1",
+                auth={"identity_key": "user_123"},
+            )
 
         exc = ctx.exception
         self.assertEqual(exc.action_type, "block_identity")
         self.assertEqual(exc.target, "user_123")
         self.assertIn("control=block_identity:user_123", str(exc))
+
+    def test_protect_injects_protector_and_applies_registered_identity(self) -> None:
+        gate = SecployGate(client=build_client(blocked=True, with_controls=True))
+        checkpoint = []
+
+        @gate.protect(endpoint="/me", method="GET")
+        def me(protector):
+            checkpoint.append("entered")
+            protector.register_identity(
+                id="user_123",
+                name="Test User",
+                email="test@example.com",
+            )
+            checkpoint.append("after")
+            return "ok"
+
+        with self.assertRaises(SecurityGateBlocked):
+            me()
+
+        self.assertEqual(checkpoint, ["entered"])
+
+    def test_protect_with_protector_defaults_to_anonymous_when_not_registered(self) -> None:
+        gate = SecployGate(client=build_client(blocked=True, with_controls=True))
+
+        @gate.protect(endpoint="/public", method="GET")
+        def public_endpoint(protector):
+            return "ok"
+
+        self.assertEqual(public_endpoint(), "ok")
 
     def test_django_middleware_uses_custom_blocked_handler(self) -> None:
         gate = SecployGate(client=build_client(blocked=True))

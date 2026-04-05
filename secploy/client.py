@@ -632,6 +632,7 @@ class SecployClient:
         self,
         method: str,
         endpoint: str,
+        auth: Optional[Dict[str, Any]] = None,
         timeout: int = 5,
     ) -> SecurityGateDecision:
         """
@@ -662,10 +663,32 @@ class SecployClient:
                 return fallback_decision
 
             url = f"{self.api_url}/projects/endpoints/blocked/check/"
+            params = {
+                "method": normalized_method,
+                "endpoint": normalized_endpoint,
+            }
+            if auth:
+                for key in (
+                    "identity_key",
+                    "user_id",
+                    "session_id",
+                    "auth_provider",
+                    "ip_address",
+                    "remote_addr",
+                    "name",
+                    "username",
+                    "avatar",
+                    "avater",
+                    "email",
+                    "is_authenticated",
+                ):
+                    value = auth.get(key)
+                    if value not in (None, ""):
+                        params[key] = value
             response = requests.get(
                 url,
                 headers=self._headers(),
-                params={"method": normalized_method, "endpoint": normalized_endpoint},
+                params=params,
                 timeout=timeout,
             )
 

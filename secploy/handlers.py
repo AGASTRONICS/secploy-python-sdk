@@ -115,6 +115,95 @@ class APIKeyBlockedException(SecurityGateBlocked):
 	http_status_code: int = 401
 
 
+class _ProtectIdentityRegistrar:
+	"""Helper injected into protected handlers to register request identity details.
+
+	Use ``register_identity(...)`` as early as possible in the handler so identity-
+	scoped controls can be enforced before business logic runs.
+	"""
+
+	def __init__(
+		self,
+		gate: "SecployGate",
+		request_payload: Dict[str, Any],
+		base_auth: Optional[Dict[str, Any]],
+		handlers: Dict[str, Optional[Callable[..., Any]]],
+		request_obj: Optional[Any],
+	):
+		self._gate = gate
+		self._request_payload = request_payload
+		self._base_auth = dict(base_auth or {})
+		self._handlers = handlers
+		self._request_obj = request_obj
+		self._resolved = False
+		self._decision: Optional[SecurityGateDecision] = None
+
+	def register_identity(
+		self,
+		id: Any,
+		name: Optional[str] = None,
+		username: Optional[str] = None,
+		avater: Optional[str] = None,
+		avatar: Optional[str] = None,
+		email: Optional[str] = None,
+		metadata: Optional[Dict[str, Any]] = None,
+		is_authenticated: Optional[bool] = None,
+		auth_provider: Optional[str] = None,
+		session_id: Optional[str] = None,
+		ip_address: Optional[str] = None,
+		remote_addr: Optional[str] = None,
+	) -> SecurityGateDecision:
+		"""Merge identity context into this protected call and evaluate the gate."""
+		identity_key = str(id).strip() if id is not None else ""
+		if not identity_key:
+			identity_key = str(self._base_auth.get("identity_key") or "").strip() or "anonymous"
+
+		auth_context = dict(self._base_auth)
+		auth_context["identity_key"] = identity_key
+
+		if name:
+			auth_context["name"] = str(name)
+		if username:
+			auth_context["username"] = str(username)
+		if avatar:
+			auth_context["avatar"] = str(avatar)
+		elif avater:
+			auth_context["avatar"] = str(avater)
+		if email:
+			auth_context["email"] = str(email)
+		if metadata is not None:
+			auth_context["metadata"] = dict(metadata)
+		if is_authenticated is not None:
+			auth_context["is_authenticated"] = bool(is_authenticated)
+		if auth_provider:
+			auth_context["auth_provider"] = str(auth_provider)
+		if session_id:
+			auth_context["session_id"] = str(session_id)
+		if ip_address:
+			auth_context["ip_address"] = str(ip_address)
+		if remote_addr:
+			auth_context["remote_addr"] = str(remote_addr)
+
+		decision = self._gate.inspect(request=self._request_payload, auth=auth_context)
+		self._resolved = True
+		self._decision = decision
+		if decision.get("blocked"):
+			request_args = (self._request_obj,) if self._request_obj is not None else ()
+			self._gate._dispatch_control_exception(decision, request_args, self._handlers)
+		return decision
+
+	def ensure_checked(self) -> None:
+		"""Guarantee at least one gate evaluation for protected handlers."""
+		if self._resolved:
+			return
+		decision = self._gate.inspect(request=self._request_payload, auth=self._base_auth)
+		self._resolved = True
+		self._decision = decision
+		if decision.get("blocked"):
+			request_args = (self._request_obj,) if self._request_obj is not None else ()
+			self._gate._dispatch_control_exception(decision, request_args, self._handlers)
+
+
 class SecploySessionAdapter:
 	"""Adapter that applies Secploy gate checks to all requests sent through a session."""
 
@@ -387,6 +476,7 @@ class SecployGate:
 			decision = self.client.get_endpoint_decision(
 				method=method,
 				endpoint=endpoint,
+				auth=auth_context,
 				timeout=timeout or self.timeout,
 			)
 			if not self.fail_open and self._is_lookup_fallback(decision):
@@ -411,6 +501,7 @@ class SecployGate:
 			}
 
 		decision["url"] = raw_url
+		decision = self._filter_controls_by_auth_scope(decision, auth_context)
 		decision["auth"] = auth_context
 		decision["metadata"] = dict(metadata or {})
 
@@ -634,7 +725,7 @@ class SecployGate:
 
 			@wraps(fn)
 			def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-				req_dict, resolved_auth = self._resolve_protect_context(
+				req_dict, resolved_auth, request_obj = self._resolve_protect_context(
 					fn, args, kwargs, endpoint, method, auth, auth_extractor
 				)
 				self._register_protected_binding(
@@ -642,16 +733,32 @@ class SecployGate:
 					method=req_dict.get("method"),
 					endpoint=req_dict.get("endpoint"),
 				)
+
+				if self._function_accepts_protector(fn, kwargs):
+					protector = _ProtectIdentityRegistrar(
+						gate=self,
+						request_payload=req_dict,
+						base_auth=resolved_auth,
+						handlers=_handlers,
+						request_obj=request_obj,
+					)
+					protected_kwargs = dict(kwargs)
+					protected_kwargs["protector"] = protector
+					result = fn(*args, **protected_kwargs)
+					protector.ensure_checked()
+					return result
+
 				decision = self.inspect(request=req_dict, auth=resolved_auth)
 				if decision.get("blocked"):
-					result = self._dispatch_control_exception(decision, args, _handlers)
+					request_args = (request_obj,) if request_obj is not None else args
+					result = self._dispatch_control_exception(decision, request_args, _handlers)
 					if result is not None:
 						return result
 				return fn(*args, **kwargs)
 
 			@wraps(fn)
 			async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-				req_dict, resolved_auth = self._resolve_protect_context(
+				req_dict, resolved_auth, request_obj = self._resolve_protect_context(
 					fn, args, kwargs, endpoint, method, auth, auth_extractor
 				)
 				self._register_protected_binding(
@@ -659,9 +766,27 @@ class SecployGate:
 					method=req_dict.get("method"),
 					endpoint=req_dict.get("endpoint"),
 				)
+
+				if self._function_accepts_protector(fn, kwargs):
+					protector = _ProtectIdentityRegistrar(
+						gate=self,
+						request_payload=req_dict,
+						base_auth=resolved_auth,
+						handlers=_handlers,
+						request_obj=request_obj,
+					)
+					protected_kwargs = dict(kwargs)
+					protected_kwargs["protector"] = protector
+					ret = fn(*args, **protected_kwargs)
+					if inspect.isawaitable(ret):
+						ret = await ret
+					protector.ensure_checked()
+					return ret
+
 				decision = self.inspect(request=req_dict, auth=resolved_auth)
 				if decision.get("blocked"):
-					result = self._dispatch_control_exception(decision, args, _handlers)
+					request_args = (request_obj,) if request_obj is not None else args
+					result = self._dispatch_control_exception(decision, request_args, _handlers)
 					if result is not None:
 						if inspect.isawaitable(result):
 							return await result
@@ -728,7 +853,7 @@ class SecployGate:
 		method: Optional[str],
 		explicit_auth: Optional[Dict[str, Any]],
 		auth_extractor: Optional[Callable[..., Optional[Dict[str, Any]]]],
-	) -> tuple:
+	) -> tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[Any]]:
 		"""Build the ``(request_dict, auth_dict)`` pair consumed by ``inspect()``.
 
 		Endpoint, method, headers, and cookies are auto-derived from the first
@@ -774,7 +899,90 @@ class SecployGate:
 			if auto_auth:
 				resolved_auth = auto_auth
 
-		return req_dict, resolved_auth
+		return req_dict, resolved_auth, request_obj
+
+	def _function_accepts_protector(self, fn: Callable, kwargs: Dict[str, Any]) -> bool:
+		"""Return True when ``protect`` should inject a ``protector`` argument."""
+		if "protector" in kwargs:
+			return False
+		try:
+			sig = inspect.signature(fn)
+		except (TypeError, ValueError):
+			return False
+		param = sig.parameters.get("protector")
+		if param is None:
+			return False
+		return param.kind in (
+			inspect.Parameter.POSITIONAL_OR_KEYWORD,
+			inspect.Parameter.KEYWORD_ONLY,
+		)
+
+	def _filter_controls_by_auth_scope(
+		self,
+		decision: SecurityGateDecision,
+		auth_context: SecurityGateAuthContext,
+	) -> SecurityGateDecision:
+		"""Drop scoped controls that do not match the current request identity."""
+		controls = decision.get("controls")
+		if not isinstance(controls, list) or not controls:
+			return decision
+
+		matched_controls = [
+			control for control in controls
+			if isinstance(control, dict) and self._is_control_applicable(control, auth_context)
+		]
+
+		if not bool(decision.get("blocked")):
+			return decision
+
+		if matched_controls:
+			if len(matched_controls) == len(controls):
+				return decision
+			filtered = dict(decision)
+			filtered["controls"] = matched_controls
+			return filtered
+
+		# Only scoped controls were returned and none matched this caller.
+		filtered = dict(decision)
+		filtered["blocked"] = False
+		filtered["allowed"] = True
+		filtered["reason"] = "control_not_applicable"
+		filtered["controls"] = []
+		return filtered
+
+	def _is_control_applicable(
+		self,
+		control: Mapping[str, Any],
+		auth_context: SecurityGateAuthContext,
+	) -> bool:
+		target = str(control.get("target") or "").strip()
+		if not target:
+			return True
+
+		action_type = str(control.get("action_type") or "").strip().lower()
+		target_type = str(control.get("target_type") or "").strip().lower()
+		normalized_target = target.lower()
+
+		if action_type in {"block_identity", "allow_identity"} or target_type in {"identity", "user", "account"}:
+			return normalized_target in {
+				str(auth_context.get("identity_key") or "").strip().lower(),
+				str(auth_context.get("user_id") or "").strip().lower(),
+			}
+
+		if action_type in {"block_ip", "allow_ip"} or target_type == "ip":
+			return normalized_target in {
+				str(auth_context.get("ip_address") or "").strip().lower(),
+				str(auth_context.get("remote_addr") or "").strip().lower(),
+			}
+
+		if action_type in {"revoke_session", "restrict_session"} or target_type == "session":
+			return normalized_target == str(auth_context.get("session_id") or "").strip().lower()
+
+		if action_type == "block_api_key" or target_type == "api_key":
+			return normalized_target == str(auth_context.get("api_key") or "").strip().lower()
+
+		# For unknown control scopes, keep current behavior and allow backend decision.
+		return True
 
 	def _dispatch_control_exception(
 		self,
@@ -1176,6 +1384,23 @@ class SecployGate:
 				user_id = getattr(user, "id", None) or getattr(user, "pk", None)
 				if user_id is not None:
 					context["user_id"] = str(user_id)
+			if context.get("username") is None:
+				username = getattr(user, "username", None) or getattr(user, "email", None)
+				if username is not None:
+					context["username"] = str(username)
+			if context.get("name") is None:
+				full_name = getattr(user, "full_name", None)
+				if not full_name and hasattr(user, "get_full_name"):
+					try:
+						full_name = user.get_full_name()
+					except Exception:
+						full_name = None
+				if full_name:
+					context["name"] = str(full_name)
+			if context.get("email") is None:
+				email = getattr(user, "email", None)
+				if email is not None:
+					context["email"] = str(email)
 
 		session = getattr(request, "session", None)
 		session_id = getattr(session, "session_key", None) or getattr(session, "sid", None)
@@ -1185,6 +1410,8 @@ class SecployGate:
 		remote_addr = self._extract_remote_addr(request)
 		if remote_addr and context.get("remote_addr") is None:
 			context["remote_addr"] = remote_addr
+		if remote_addr and context.get("ip_address") is None:
+			context["ip_address"] = remote_addr
 
 		header_map = {str(key).lower(): value for key, value in dict(headers).items()}
 		header_identity = self._first_non_empty(
@@ -1196,6 +1423,12 @@ class SecployGate:
 			context["identity_key"] = str(header_identity)
 		if header_map.get("x-user-id") and context.get("user_id") is None:
 			context["user_id"] = str(header_map["x-user-id"])
+		if header_map.get("x-user-name") and context.get("name") is None:
+			context["name"] = str(header_map["x-user-name"])
+		if header_map.get("x-user-username") and context.get("username") is None:
+			context["username"] = str(header_map["x-user-username"])
+		if header_map.get("x-user-email") and context.get("email") is None:
+			context["email"] = str(header_map["x-user-email"])
 
 		header_session = self._first_non_empty(
 			header_map.get("x-session-id"),
@@ -1203,6 +1436,18 @@ class SecployGate:
 		)
 		if header_session and context.get("session_id") is None:
 			context["session_id"] = str(header_session)
+
+		header_ip = self._first_non_empty(
+			header_map.get("x-forwarded-for"),
+			header_map.get("x-real-ip"),
+			header_map.get("cf-connecting-ip"),
+		)
+		if header_ip:
+			normalized_ip = str(header_ip).split(",", 1)[0].strip()
+			if normalized_ip and context.get("remote_addr") is None:
+				context["remote_addr"] = normalized_ip
+			if normalized_ip and context.get("ip_address") is None:
+				context["ip_address"] = normalized_ip
 
 		auth_header = header_map.get("authorization")
 		if auth_header:
@@ -1228,6 +1473,17 @@ class SecployGate:
 		)
 		if cookie_session and context.get("session_id") is None:
 			context["session_id"] = str(cookie_session)
+
+		if context.get("ip_address") is None and context.get("remote_addr") is not None:
+			context["ip_address"] = str(context.get("remote_addr"))
+		if context.get("remote_addr") is None and context.get("ip_address") is not None:
+			context["remote_addr"] = str(context.get("ip_address"))
+		if context.get("identity_key") is None:
+			context["identity_key"] = "anonymous"
+		if context.get("ip_address") is None:
+			context["ip_address"] = "unknown"
+		if context.get("remote_addr") is None:
+			context["remote_addr"] = str(context.get("ip_address") or "unknown")
 
 		return {key: value for key, value in context.items() if value not in (None, "")}
 

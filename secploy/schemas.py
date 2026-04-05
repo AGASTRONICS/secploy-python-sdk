@@ -62,6 +62,13 @@ class SecurityGateAuthContext(TypedDict, total=False):
     auth_provider: str
     authorization_scheme: str
     user_id: str
+    name: str
+    username: str
+    avatar: str
+    email: str
+    metadata: Dict[str, Any]
+    is_authenticated: bool
+    ip_address: str
     remote_addr: str
 
 
