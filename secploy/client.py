@@ -21,9 +21,13 @@ from .schemas import (
     SecurityGateDecision,
 )
 from .log_capture import SecployLogCapturer
-from .events import EventHandler
+from .errors import culprit_from, parse_exception
+from .events import DEFAULT_MAX_QUEUE_SIZE, EventHandler
+from .scrubbing import Scrubber
 from .processor import EventProcessor
 from .config_manager import ConfigManager
+from .policy_cache import SecurityPolicyCache
+from .identity_reporter import IdentityReporter
 from .system_metrics import SystemMetricsCollector
 
 if TYPE_CHECKING:
@@ -132,9 +136,12 @@ class SecployClient:
         self.organization_id = getattr(config, 'organization_id', None)
         self.environment = getattr(config, 'environment', 'development')
         self.sampling_rate = getattr(config, 'sampling_rate', 1.0)
+        # The version of the application being observed. Attached to every
+        # error; without it an issue cannot say which build it first appeared
+        # in, and "this regressed in 2.4.1" is unanswerable.
+        self.release = getattr(config, 'release', None)
         self.ingest_url = getattr(config, 'ingest_url').rstrip("/")
         self.api_url = getattr(config, 'api_url', 'https://api.secploy.com').rstrip("/")
-        self.heartbeat_interval = getattr(config, 'heartbeat_interval', 60)
         self.max_retry = getattr(config, 'max_retry', 5)
         self.debug = getattr(config, 'debug', False)
         self.log_level = getattr(config, 'log_level', 'INFO')
@@ -157,8 +164,26 @@ class SecployClient:
         self.flush_interval = getattr(config, 'flush_interval', 60)  # Max seconds between flushes
 
         # Initialize internal state
-        self._event_queue = queue.Queue()
-        self._event_handler = EventHandler(self._event_queue)
+        # Bounded: see DEFAULT_MAX_QUEUE_SIZE. An unbounded queue here meant an
+        # unreachable ingest grew the host application's memory until it died.
+        self._event_queue = queue.Queue(
+            maxsize=getattr(config, "max_queue_size", DEFAULT_MAX_QUEUE_SIZE)
+        )
+        # Credentials never leave the process. See scrubbing.py for what
+        # counts as one and why identifiers deliberately do not.
+        self._scrubber = Scrubber(
+            deny_keys=getattr(config, "scrub_fields", None),
+            enabled=bool(getattr(config, "scrub_enabled", True)),
+        )
+        self._event_handler = EventHandler(
+            self._event_queue,
+            scrubber=self._scrubber,
+            before_send=getattr(config, "before_send", None),
+            # Applied at last. It has been in the configuration - documented,
+            # defaulted, validated - and never read, so a project that turned
+            # its volume down was still sending all of it.
+            sampling_rate=self.sampling_rate,
+        )
         
         # Initialize event processor
         self._event_processor = EventProcessor(
@@ -181,6 +206,34 @@ class SecployClient:
         self.configs = ConfigManager(
             api_url=self.api_url,
             headers_callback=self._headers,
+        )
+
+        # Security policy cache backing the gate.
+        #
+        # "remote" keeps the historical per-request API lookup and stays the
+        # default, so upgrading the SDK never changes enforcement on its own.
+        # "shadow" proves the local cache agrees with the API on real traffic.
+        # "cached" takes the network call off the request path entirely.
+        gate_mode = str(getattr(config, 'gate_mode', 'remote') or 'remote').lower()
+        if gate_mode not in ('remote', 'cached', 'shadow'):
+            raise ValueError(
+                f"Invalid gate_mode: {gate_mode!r}. "
+                "Must be one of: remote, cached, shadow."
+            )
+        self.gate_mode = gate_mode
+        self.security_policy = SecurityPolicyCache(
+            api_url=self.api_url,
+            headers_callback=self._headers,
+            max_staleness=int(getattr(config, 'max_policy_staleness', 900) or 900),
+        )
+
+        # Identity telemetry. With the gate cached there is no per-request call
+        # to carry identity to the API, so it is batched and deduplicated here.
+        self.identities = IdentityReporter(
+            api_url=self.api_url,
+            headers_callback=self._headers,
+            report_interval=int(getattr(config, 'identity_report_interval', 300) or 300),
+            flush_interval=int(getattr(config, 'identity_flush_interval', 30) or 30),
         )
 
         # Ergonomic config access, e.g. client.env.google_api_key
@@ -238,6 +291,129 @@ class SecployClient:
             "X-Organization-ID": f"{self.organization_id}",
             "Content-Type": "application/json",
         }
+
+    def _report_error(
+        self,
+        parsed: Dict[str, Any],
+        level: str = "error",
+        mechanism: str = "manual",
+        handled: bool = True,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Send a parsed exception as an event.
+
+        One builder for every path - a crash, a logged error, an explicit
+        capture - so that the same failure reported three ways produces one
+        issue rather than three.
+        """
+        try:
+            context: Dict[str, Any] = {
+                "exception_type": parsed.get("type"),
+                "exception_value": parsed.get("value"),
+                # Both shapes go out: structured frames for grouping and
+                # display, the formatted strings so an ingest that predates
+                # them still understands the event.
+                "stacktrace": parsed.get("stacktrace") or [],
+                "frames": parsed.get("frames") or [],
+                # No culprit here on purpose. Each side owns what it actually
+                # knows: the SDK knows which frames are the application's own,
+                # because it is running inside it; the ingest owns how a module
+                # path is normalised, because that rule has to be identical for
+                # every event whatever sent it. Sending our own culprit as well
+                # produced a field that quietly disagreed with the issue's.
+                "environment": self.environment,
+                "mechanism": mechanism,
+                "handled": handled,
+            }
+            if self.release:
+                context["release"] = self.release
+            if extra:
+                context.update(extra)
+
+            return self.send_event(level, {
+                "type": level,
+                "message": f"{parsed.get('type')}: {parsed.get('value')}",
+                "context": context,
+            })
+        except Exception as exc:
+            # Reporting a failure must never become one.
+            secploy_logger.error(f"Failed to build an error report: {exc}")
+            return False
+
+    def capture_exception(
+        self,
+        error: Any = None,
+        level: str = "error",
+        **context: Any,
+    ) -> bool:
+        """
+        Report an exception that was caught and handled.
+
+        Called with no argument inside an ``except`` block it picks up the
+        exception being handled, which is the shape this is nearly always used
+        in::
+
+            try:
+                charge(order)
+            except PaymentError:
+                client.capture_exception()
+                raise
+        """
+        return self._report_error(
+            parse_exception(error),
+            level=level,
+            mechanism="manual",
+            handled=True,
+            extra=context or None,
+        )
+
+    def capture_message(
+        self,
+        message: str,
+        level: str = "info",
+        **context: Any,
+    ) -> bool:
+        """
+        Report a message with no exception behind it.
+
+        The stack is captured from the caller so the event still says where it
+        came from.
+        """
+        import traceback as _traceback
+
+        try:
+            frames = []
+            stack = _traceback.extract_stack()[:-1]
+            from .errors import _app_root, _is_vendor, _module_for
+
+            root = _app_root()
+            for summary in stack[-20:]:
+                filename = summary.filename or ""
+                frames.append({
+                    "filename": filename,
+                    "module": _module_for(filename, root),
+                    "function": summary.name or "",
+                    "lineno": summary.lineno,
+                    "context_line": (summary.line or "").strip() or None,
+                    "in_app": bool(filename) and not _is_vendor(filename),
+                })
+        except Exception:
+            frames = []
+
+        return self._report_error(
+            {
+                "type": "Message",
+                "value": message,
+                "frames": frames,
+                "stacktrace": [message],
+                "culprit": culprit_from(frames),
+            },
+            level=level,
+            mechanism="manual",
+            handled=True,
+            extra=context or None,
+        )
 
     def send_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
         """
@@ -628,7 +804,7 @@ class SecployClient:
             normalized_endpoint = f"/{normalized_endpoint}"
         return normalized_endpoint
 
-    def get_endpoint_decision(
+    def _remote_endpoint_decision(
         self,
         method: str,
         endpoint: str,
@@ -636,9 +812,9 @@ class SecployClient:
         timeout: int = 5,
     ) -> SecurityGateDecision:
         """
-        Return the current Secploy decision for an endpoint.
+        Ask the API for a decision. One network round trip per call.
 
-        On lookup failures, this method fails open and returns an allowed decision.
+        On lookup failures this fails open and returns an allowed decision.
         """
         normalized_method = (method or "").strip().upper()
         normalized_endpoint = self._normalize_endpoint_reference(endpoint)
@@ -710,29 +886,9 @@ class SecployClient:
                 fallback_decision["reason"] = "invalid_json"
                 return fallback_decision
 
-            blocked = bool(payload.get("blocked", False))
-            rule = payload.get("rule") or {}
-            controls = payload.get("controls") or payload.get("actions") or []
-            reason = payload.get("reason") or rule.get("reason") or (
-                "blocked_by_rule" if blocked else "allowed"
+            return self._decision_from_payload(
+                payload, normalized_method, normalized_endpoint, endpoint
             )
-            decision: SecurityGateDecision = {
-                "allowed": not blocked,
-                "blocked": blocked,
-                "method": normalized_method,
-                "endpoint": normalized_endpoint,
-                "url": endpoint,
-                "reason": str(reason),
-                "rule": rule if isinstance(rule, dict) else {},
-                "controls": controls if isinstance(controls, list) else [],
-                "raw": payload,
-            }
-            if blocked:
-                secploy_logger.debug(
-                    f"Endpoint {normalized_method} {normalized_endpoint} is blocked by rule: "
-                    f"{decision['reason']}"
-                )
-            return decision
 
         except requests.RequestException as e:
             secploy_logger.warning(f"Network error while fetching endpoint decision: {e}")
@@ -740,6 +896,187 @@ class SecployClient:
         except Exception as e:
             secploy_logger.warning(f"Unexpected error in endpoint decision lookup: {e}")
             return fallback_decision
+
+    def _decision_from_payload(
+        self,
+        payload: Dict[str, Any],
+        normalized_method: str,
+        normalized_endpoint: str,
+        raw_endpoint: str,
+    ) -> SecurityGateDecision:
+        """
+        Build a gate decision from a raw decision payload.
+
+        Both the remote lookup and the local policy cache feed this one builder,
+        so a cached decision is identical to the one the API would have returned.
+        Any divergence would show up as a shadow-mode mismatch rather than
+        silently changing what gets blocked.
+        """
+        blocked = bool(payload.get("blocked", False))
+        rule = payload.get("rule") or {}
+        controls = payload.get("controls") or payload.get("actions") or []
+        reason = payload.get("reason") or rule.get("reason") or (
+            "blocked_by_rule" if blocked else "allowed"
+        )
+        decision: SecurityGateDecision = {
+            "allowed": not blocked,
+            "blocked": blocked,
+            "method": normalized_method,
+            "endpoint": normalized_endpoint,
+            "url": raw_endpoint,
+            "reason": str(reason),
+            "rule": rule if isinstance(rule, dict) else {},
+            "controls": controls if isinstance(controls, list) else [],
+            "raw": payload,
+        }
+        if blocked:
+            secploy_logger.debug(
+                f"Endpoint {normalized_method} {normalized_endpoint} is blocked by rule: "
+                f"{decision['reason']}"
+            )
+        return decision
+
+    def _cached_endpoint_decision(
+        self,
+        method: str,
+        endpoint: str,
+        auth: Optional[Dict[str, Any]] = None,
+    ) -> Optional[SecurityGateDecision]:
+        """
+        Decide from the in-process policy snapshot. No I/O.
+
+        Returns None when no snapshot has loaded yet, so the caller can fall back
+        to the network rather than guess at a policy it has not seen.
+        """
+        normalized_method = (method or "").strip().upper()
+        normalized_endpoint = self._normalize_endpoint_reference(endpoint)
+        if not normalized_method or not normalized_endpoint:
+            return None
+
+        try:
+            payload = self.security_policy.evaluate(
+                method=normalized_method,
+                endpoint=normalized_endpoint,
+                auth=auth,
+                project_key=self.api_key,
+                env_key=self.environment_key or "",
+            )
+        except Exception as exc:
+            secploy_logger.warning(f"Local policy evaluation failed: {exc}")
+            return None
+
+        if payload is None:
+            return None
+
+        # The remote path reports identity as a side effect of its query string;
+        # on this path nothing else would, so record it here. Deduplicated and
+        # batched, so a repeat visitor costs a dict lookup and nothing more.
+        try:
+            self.identities.record(auth)
+        except Exception as exc:
+            secploy_logger.warning(f"Identity record failed: {exc}")
+
+        return self._decision_from_payload(
+            payload, normalized_method, normalized_endpoint, endpoint
+        )
+
+    @staticmethod
+    def _decision_signature(decision: SecurityGateDecision) -> Tuple:
+        """The parts of a decision that have to agree for the cache to be correct."""
+        rule = decision.get("rule") or {}
+        controls = decision.get("controls") or []
+        return (
+            bool(decision.get("blocked")),
+            str(decision.get("reason") or ""),
+            str(rule.get("id") or ""),
+            tuple(sorted(str(c.get("id") or "") for c in controls if isinstance(c, dict))),
+        )
+
+    def _report_shadow_mismatch(
+        self,
+        local: SecurityGateDecision,
+        remote: SecurityGateDecision,
+        method: str,
+        endpoint: str,
+    ) -> None:
+        local_sig = self._decision_signature(local)
+        remote_sig = self._decision_signature(remote)
+        secploy_logger.warning(
+            f"Secploy gate shadow mismatch on {method} {endpoint}: "
+            f"local={local_sig} remote={remote_sig}"
+        )
+        try:
+            self.send_event(
+                "secploy.gate.shadow_mismatch",
+                {
+                    "method": method,
+                    "endpoint": endpoint,
+                    "policy_version": self.security_policy.version,
+                    "local": {
+                        "blocked": local_sig[0],
+                        "reason": local_sig[1],
+                        "rule_id": local_sig[2],
+                        "control_ids": list(local_sig[3]),
+                    },
+                    "remote": {
+                        "blocked": remote_sig[0],
+                        "reason": remote_sig[1],
+                        "rule_id": remote_sig[2],
+                        "control_ids": list(remote_sig[3]),
+                    },
+                },
+            )
+        except Exception as exc:
+            secploy_logger.warning(f"Failed to report shadow mismatch: {exc}")
+
+    def get_endpoint_decision(
+        self,
+        method: str,
+        endpoint: str,
+        auth: Optional[Dict[str, Any]] = None,
+        timeout: int = 5,
+    ) -> SecurityGateDecision:
+        """
+        Return the current Secploy decision for an endpoint.
+
+        Behaviour depends on ``gate_mode``:
+
+        ``remote``
+            Ask the API on every call. The original behaviour, and still the
+            default so upgrading the SDK changes nothing on its own.
+        ``cached``
+            Decide from the local policy snapshot, with no network call. Falls
+            back to a remote lookup only while the first snapshot is still
+            loading.
+        ``shadow``
+            Decide locally *and* remotely, report any disagreement, and return
+            the remote decision. Run this in production to prove the cache
+            agrees with the API before switching to ``cached``.
+
+        On lookup failures this fails open and returns an allowed decision.
+        """
+        mode = self.gate_mode
+
+        if mode == "cached":
+            decision = self._cached_endpoint_decision(method, endpoint, auth)
+            if decision is not None:
+                return decision
+            # No snapshot yet — usually the first request after start-up.
+            secploy_logger.debug(
+                "Security policy not loaded yet; falling back to a remote lookup."
+            )
+            return self._remote_endpoint_decision(method, endpoint, auth, timeout)
+
+        if mode == "shadow":
+            local = self._cached_endpoint_decision(method, endpoint, auth)
+            remote = self._remote_endpoint_decision(method, endpoint, auth, timeout)
+            if local is not None and remote.get("reason") != "lookup_unavailable":
+                if self._decision_signature(local) != self._decision_signature(remote):
+                    self._report_shadow_mismatch(local, remote, method, endpoint)
+            # The API stays authoritative in shadow mode.
+            return remote
+
+        return self._remote_endpoint_decision(method, endpoint, auth, timeout)
 
     def endpoint_blocked(
         self,
@@ -1323,6 +1660,10 @@ class SecployClient:
         if self.remote_scan_requests:
             self._start_dependency_scan_request_polling()
 
+        if self.gate_mode != 'remote':
+            self._start_security_policy()
+            self.identities.start()
+
         if self.realtime:
             ws_url = (
                 self.api_url
@@ -1330,6 +1671,39 @@ class SecployClient:
                 .replace("http://", "ws://")
             ) + "/ws/sdk/configs/"
             self.configs.start_realtime(ws_url, self._headers)
+
+    def _start_security_policy(self) -> None:
+        """
+        Load the policy snapshot and subscribe to changes.
+
+        The first fetch runs on a background thread so importing and starting the
+        SDK never blocks the host application on a network call. Until it lands,
+        the gate falls back to a remote lookup, so requests are decided correctly
+        from the very first one rather than being waved through.
+        """
+        def _bootstrap():
+            try:
+                self.security_policy.fetch()
+            except Exception as exc:
+                secploy_logger.warning(f"Initial security policy fetch failed: {exc}")
+
+            if not self.realtime:
+                return
+            ws_url = (
+                self.api_url
+                .replace("https://", "wss://")
+                .replace("http://", "ws://")
+            ) + "/ws/sdk/security/"
+            try:
+                self.security_policy.start_realtime(ws_url, self._headers)
+            except Exception as exc:
+                secploy_logger.warning(f"Security policy real-time failed to start: {exc}")
+
+        threading.Thread(
+            target=_bootstrap,
+            daemon=True,
+            name="secploy-security-bootstrap",
+        ).start()
 
     def stop(self):
         """Stop the client and wait for processing to finish."""
@@ -1340,6 +1714,12 @@ class SecployClient:
 
         # Stop real-time config delivery (WebSocket + polling fallback)
         self.configs.stop_realtime()
+
+        # Stop security policy delivery
+        self.security_policy.stop_realtime()
+
+        # Flush any identity records still pending
+        self.identities.stop()
 
         # Stop dependency scan request polling.
         self._stop_dependency_scan_request_polling()

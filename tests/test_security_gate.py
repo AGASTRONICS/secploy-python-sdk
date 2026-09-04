@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from secploy.scrubbing import hash_session_id
 from secploy import SecployClient, SecployGate, SecurityGateBlocked
 from secploy.gates import GateDecision, GateRequest, SecployGate as CompatSecployGate
 from secploy.gates import SecurityGateException
@@ -121,7 +122,12 @@ class SecployGateRuntimeTests(unittest.TestCase):
         _, payload = client.send_event.call_args.args
         ctx = payload["context"]
         self.assertEqual(ctx["user_id"], "u_42")
-        self.assertEqual(ctx["session_id"], "sess_99")
+        # Hashed on the way out. A session identifier is a live credential:
+        # whoever reads one out of an event store can replay it. The hash keeps
+        # what the product needs - a stable, unique handle - and removes what it
+        # never needed.
+        self.assertEqual(ctx["session_id"], hash_session_id("sess_99"))
+        self.assertNotEqual(ctx["session_id"], "sess_99")
         self.assertEqual(ctx["auth_provider"], "bearer")
         self.assertEqual(ctx["remote_addr"], "10.0.0.1")
 

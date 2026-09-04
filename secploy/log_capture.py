@@ -10,6 +10,8 @@ import logging
 import sys
 import threading
 import traceback
+
+from .errors import culprit_from, extract_frames, parse_exception
 from typing import Any, Dict, Optional, List, Union
 from datetime import datetime
 from queue import Queue
@@ -109,8 +111,39 @@ class SecployLogCapturer:
             self._send_exception(RuntimeError, RuntimeError(context["message"]), None, source="asyncio")
 
     def _send_exception(self, exc_type, exc_value, exc_tb, source="system"):
-        stacktrace = traceback.format_exception(exc_type, exc_value, exc_tb)
+        """
+        Report a crash the application never caught.
 
+        Routed through the client's own error builder so an uncaught exception,
+        a logged one and an explicit capture_exception() all arrive in the same
+        shape and group into a single issue rather than three.
+        """
+        parsed = parse_exception(exc_value if exc_value is not None else None)
+
+        # The excepthooks hand us the traceback directly, which is better than
+        # whatever the exception object carries - a re-raised exception may have
+        # lost it.
+        if exc_tb is not None:
+            try:
+                parsed["frames"] = extract_frames(exc_tb)
+                parsed["stacktrace"] = traceback.format_exception(exc_type, exc_value, exc_tb)
+                parsed["culprit"] = culprit_from(parsed["frames"])
+            except Exception:
+                # Keep whatever parse_exception managed.
+                pass
+
+        report = getattr(self.client, "_report_error", None)
+        if callable(report):
+            report(
+                parsed,
+                level="fatal",
+                mechanism=f"exception.{source}",
+                handled=False,
+            )
+            return
+
+        # An older client without the shared builder. Fall back to the original
+        # shape rather than dropping the crash.
         log_entry = LogEntry(
             timestamp=datetime.now().timestamp(),
             type="error",
@@ -121,7 +154,7 @@ class SecployLogCapturer:
                 http_method="NONE",
                 http_url="",
                 http_status=500,
-                stacktrace=stacktrace,
+                stacktrace=parsed.get("stacktrace") or [],
                 tags=Tags(
                     environment=self.client.environment,
                     service=f"exception.{source}",
@@ -129,8 +162,7 @@ class SecployLogCapturer:
                 )
             )
         )
-        payload = log_entry.model_dump(mode="json")
-        self.client.send_event("error", payload)
+        self.client.send_event("error", log_entry.model_dump(mode="json"))
 
 
 class SecployLogHandler(logging.Handler):

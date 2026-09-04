@@ -12,6 +12,7 @@ import requests
 
 from .lib import secploy_logger
 from .schemas import SecurityGateAuthContext, SecurityGateDecision
+from .scrubbing import hash_session_id
 
 if TYPE_CHECKING:
 	from .client import SecployClient
@@ -1498,6 +1499,20 @@ class SecployGate:
 			context["ip_address"] = "unknown"
 		if context.get("remote_addr") is None:
 			context["remote_addr"] = str(context.get("ip_address") or "unknown")
+
+		# The session identifier arrives from a cookie, a header or a framework
+		# session object, and in every one of those cases it is a live
+		# credential: whoever reads it out of an event store can replay it.
+		#
+		# Hashing here, at the one point every path converges on, keeps
+		# everything the product actually needs. The value is stable, so a
+		# session is still recognisable across events and across processes; it
+		# is unique, so sessions stay distinct; and the gate hashes the incoming
+		# request the same way, so a control targeting a session still matches.
+		# What is lost is only the ability to reuse it, which nothing here
+		# wanted.
+		if context.get("session_id") is not None:
+			context["session_id"] = hash_session_id(context["session_id"])
 
 		return {key: value for key, value in context.items() if value not in (None, "")}
 

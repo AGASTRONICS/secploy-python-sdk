@@ -11,7 +11,6 @@ class SecployConfig(TypedDict, total=False):
     environment: str
     ingest_url: str
     api_url: str
-    heartbeat_interval: int
     max_retry: int
     debug: bool
     sampling_rate: float
@@ -19,9 +18,6 @@ class SecployConfig(TypedDict, total=False):
     batch_size: int
     max_queue_size: int
     flush_interval: int
-    retry_attempts: int
-    ignore_errors: bool
-    source_root: Optional[str]
     instrument_outbound_requests: bool
     instrument_httpx_async: bool
     remote_scan_requests: bool
@@ -31,6 +27,10 @@ class SecployConfig(TypedDict, total=False):
     dependency_report_incidents_limit: int
     dependency_report_include_current_issues: bool
     dependency_report_include_latest_issues: bool
+    gate_mode: str
+    max_policy_staleness: int
+    identity_report_interval: int
+    identity_flush_interval: int
 
 
 class DependencyScanRequest(TypedDict, total=False):

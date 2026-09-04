@@ -16,6 +16,8 @@ from .handlers import (
     RateLimitedException,
     APIKeyBlockedException,
 )
+from .identity_reporter import IdentityReporter
+from .policy_cache import PolicySnapshot, SecurityPolicyCache
 from .schemas import SecployConfig
 from .schemas import LogLevel
 from .system_metrics import SystemMetricsCollector
@@ -35,6 +37,9 @@ __all__ = [
     "GateRequest",
     "GateDecision",
     "SecployConfig",
+    "SecurityPolicyCache",
+    "PolicySnapshot",
+    "IdentityReporter",
     "LogLevel",
     "SystemMetricsCollector",
     "SecployRegister",

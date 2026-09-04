@@ -25,10 +25,6 @@ DEFAULT_CONFIG = {
     "batch_size": 100,
     "max_queue_size": 10000,
     "flush_interval": 5,
-    "retry_attempts": 3,
-    "ignore_errors": True,
-    "source_root": None,
-    "heartbeat_interval": 60,
     "max_retry": 5,
     "debug": False,
     "ingest_url": "https://ingest.secploy.com",
@@ -38,7 +34,52 @@ DEFAULT_CONFIG = {
     "remote_scan_requests": True,
     "scan_request_poll_interval": 30,
     "auto_dependency_health_report": True,
+    # Redact credentials from every outgoing event. Off only for a deployment
+    # that has its own scrubbing in front of the SDK.
+    "scrub_enabled": True,
+    # Extra key names to redact, on top of the built-in denylist.
+    "scrub_fields": [],
+    # Optional callable run on every event before it is queued. Return the
+    # event to send it, or None to drop it. Cannot be set from a config file;
+    # pass it programmatically.
+    "before_send": None,
 }
+
+# Options that were accepted but never did anything. Kept as aliases where a
+# working option covers the same ground, so an existing config file does not
+# start failing - and warned about, so it stops being copied forward.
+_RENAMED = {"retry_attempts": "max_retry"}
+_RETIRED = ("ignore_errors", "source_root", "heartbeat_interval")
+
+
+def migrate_retired_options(config: dict) -> dict:
+    """
+    Fold options that never had an effect into ones that do.
+
+    Silently ignoring them is how they survived this long: they were
+    documented, defaulted and validated, so setting one looked like it worked.
+    """
+    for old, new in _RENAMED.items():
+        if old in config:
+            value = config.pop(old)
+            logger.warning(
+                f"'{old}' is not used; it never was. Its value has been applied "
+                f"to '{new}', which is the option that governs this. Rename it "
+                f"in your configuration."
+            )
+            config.setdefault(new, value)
+
+    for name in _RETIRED:
+        if name in config:
+            config.pop(name)
+            logger.warning(
+                f"'{name}' is not used and has been ignored. It was accepted "
+                f"and validated but never read, so setting it never had an "
+                f"effect. Remove it from your configuration."
+            )
+
+    return config
+
 
 def find_project_config() -> Optional[str]:
     """
@@ -134,7 +175,9 @@ def load_config(file_path: Optional[str] = None) -> Dict[str, Union[str, int, fl
                         logger.info("Loaded key-value configuration.")
                 
                 # Update config with file values
-                config.update(file_config)
+                # Fold in options that were accepted but never had an effect,
+                # before anything downstream reads them.
+                config.update(migrate_retired_options(dict(file_config)))
         except Exception as e:
             logger.warning(f"Error loading config file: {e}")
             
@@ -200,10 +243,11 @@ def validate_config(config: Dict[str, Union[str, int, float, bool, None]]) -> bo
         if flush_interval < 0:
             raise ValueError("flush_interval must be non-negative")
 
-        # Validate retry attempts
-        retry_attempts = int(config.get('retry_attempts', 3))
-        if retry_attempts < 0:
-            raise ValueError("retry_attempts must be non-negative")
+        # `retry_attempts` used to be validated here alongside `max_retry`,
+        # which is the one the transport actually reads. Setting it passed
+        # validation and changed nothing, while the option that governed
+        # delivery sat next to it under a different name. It is accepted as an
+        # alias below rather than silently ignored.
 
         # Validate environment
         environment = config.get('environment', 'development')

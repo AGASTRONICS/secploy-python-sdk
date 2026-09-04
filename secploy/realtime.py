@@ -9,7 +9,7 @@ If not installed, the client automatically falls back to polling.
 
 import json
 import threading
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Sequence
 
 from .lib import secploy_logger
 
@@ -18,18 +18,22 @@ _MAX_BACKOFF = 60       # seconds
 _POLL_FALLBACK_INTERVAL = 15  # seconds
 
 
-class ConfigRealtime:
+class RealtimeChannel:
     """
-    Maintains a long-lived WebSocket connection to the Secploy config stream.
+    Maintains a long-lived WebSocket connection to a Secploy push stream.
 
-    When a ``config.update`` message arrives the ``on_update`` callback is
-    invoked immediately so the local cache is refreshed.  While the socket is
+    When an update message arrives the ``on_update`` callback is invoked
+    immediately so the local cache is refreshed.  While the socket is
     disconnected a polling thread fires every 15 s as a fallback; it stops
     automatically once the socket reconnects.
 
+    The server pushes an invalidation, not a payload, so ``on_update`` is
+    expected to refetch. That keeps delivery idempotent: a duplicated or
+    out-of-order notification costs one extra fetch and can never corrupt state.
+
     Usage::
 
-        realtime = ConfigRealtime(
+        realtime = RealtimeChannel(
             ws_url="wss://api.secploy.com/ws/sdk/configs/",
             headers_callback=client._headers,
             on_update=config_manager.fetch,
@@ -44,10 +48,16 @@ class ConfigRealtime:
         ws_url: str,
         headers_callback: Callable[[], Dict[str, str]],
         on_update: Callable[[], None],
+        channel_name: str = "config",
+        thread_prefix: str = "secploy-config",
+        update_message_types: Sequence[str] = ("config.update", "config.subscribed"),
     ):
         self._ws_url = ws_url
         self._get_headers = headers_callback
         self._on_update = on_update
+        self._channel_name = channel_name
+        self._thread_prefix = thread_prefix
+        self._update_message_types = tuple(update_message_types)
 
         self._ws = None
         self._ws_thread: Optional[threading.Thread] = None
@@ -68,7 +78,7 @@ class ConfigRealtime:
         self._ws_thread = threading.Thread(
             target=self._run_with_reconnect,
             daemon=True,
-            name="secploy-config-ws",
+            name=f"{self._thread_prefix}-ws",
         )
         self._ws_thread.start()
 
@@ -97,8 +107,8 @@ class ConfigRealtime:
             import websocket  # noqa: PLC0415 – optional dependency
         except ImportError:
             secploy_logger.warning(
-                "websocket-client is not installed; config real-time push is "
-                "unavailable.  Falling back to 15 s polling.  "
+                f"websocket-client is not installed; {self._channel_name} "
+                "real-time push is unavailable.  Falling back to 15 s polling.  "
                 "Install it with: pip install websocket-client"
             )
             self._start_polling()
@@ -131,14 +141,15 @@ class ConfigRealtime:
                 break
 
             secploy_logger.warning(
-                f"Config WebSocket disconnected. Reconnecting in {backoff}s…"
+                f"{self._channel_name} WebSocket disconnected. "
+                f"Reconnecting in {backoff}s…"
             )
             self._start_polling()
             self._stop_event.wait(timeout=backoff)
             backoff = min(backoff * 2, _MAX_BACKOFF)
 
     def _on_open(self, ws) -> None:
-        secploy_logger.info("Config WebSocket connected.")
+        secploy_logger.info(f"{self._channel_name} WebSocket connected.")
         self._connected.set()
         self._stop_polling()
 
@@ -149,18 +160,20 @@ class ConfigRealtime:
             return
 
         msg_type = data.get("type", "")
-        if msg_type in ("config.update", "config.subscribed"):
+        if msg_type in self._update_message_types:
             try:
                 self._on_update()
             except Exception as exc:
-                secploy_logger.warning(f"Config update handler failed: {exc}")
+                secploy_logger.warning(
+                    f"{self._channel_name} update handler failed: {exc}"
+                )
 
     def _on_error(self, ws, error) -> None:
-        secploy_logger.warning(f"Config WebSocket error: {error}")
+        secploy_logger.warning(f"{self._channel_name} WebSocket error: {error}")
 
     def _on_close(self, ws, close_status_code, close_msg) -> None:
         secploy_logger.info(
-            f"Config WebSocket closed (code={close_status_code})."
+            f"{self._channel_name} WebSocket closed (code={close_status_code})."
         )
         self._connected.clear()
 
@@ -182,16 +195,19 @@ class ConfigRealtime:
                 try:
                     self._on_update()
                 except Exception as exc:
-                    secploy_logger.warning(f"Config poll failed: {exc}")
+                    secploy_logger.warning(
+                        f"{self._channel_name} poll failed: {exc}"
+                    )
 
         self._poll_thread = threading.Thread(
             target=_loop,
             daemon=True,
-            name="secploy-config-poll",
+            name=f"{self._thread_prefix}-poll",
         )
         self._poll_thread.start()
         secploy_logger.info(
-            f"Config polling fallback started (every {_POLL_FALLBACK_INTERVAL}s)."
+            f"{self._channel_name} polling fallback started "
+            f"(every {_POLL_FALLBACK_INTERVAL}s)."
         )
 
     def _stop_polling(self) -> None:
@@ -199,3 +215,27 @@ class ConfigRealtime:
         if self._poll_thread is not None:
             self._poll_thread.join(timeout=3)
             self._poll_thread = None
+
+
+class ConfigRealtime(RealtimeChannel):
+    """
+    Config-stream channel.
+
+    Kept as a named subclass so existing callers and any user code importing
+    ``ConfigRealtime`` keep working unchanged.
+    """
+
+    def __init__(
+        self,
+        ws_url: str,
+        headers_callback: Callable[[], Dict[str, str]],
+        on_update: Callable[[], None],
+    ):
+        super().__init__(
+            ws_url=ws_url,
+            headers_callback=headers_callback,
+            on_update=on_update,
+            channel_name="config",
+            thread_prefix="secploy-config",
+            update_message_types=("config.update", "config.subscribed"),
+        )
